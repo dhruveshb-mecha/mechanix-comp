@@ -1,14 +1,19 @@
-[workspace]
-members = ["."]
-
 [package]
 name = "compositor"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["."]
+
 [dependencies]
-smithay = { git = "https://github.com/Smithay/smithay", branch = "master", default-features = false, features = [
+smithay = {
+  git = "https://github.com/Smithay/smithay",
+  rev = "492497f064d786aafec3c01e03b24a2cd0d31426",
+  default-features = false,
+  features = [
     "backend_winit",
-    "wayland_frontend",
     "desktop",
-] }
+    "wayland_frontend",
+  ]
+}
