@@ -7,4 +7,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-smithay = { version = "0.7", default-features = false, features = ["wayland_frontend"] }
+smithay = { version = "0.7", default-features = false, features = [
+    "backend_winit",
+    "wayland_frontend",
+    "desktop",
+] }

@@ -1,51 +1,26 @@
-use std::sync::Arc;
+mod handlers;
+mod state;
+mod winit;
 
-use smithay::reexports::{
-    calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic},
-    wayland_server::{
-        Display, ListeningSocket,
-        backend::{ClientData, ClientId, DisconnectReason},
-    },
-};
+use crate::state::State;
+use smithay::reexports::calloop::EventLoop;
+use smithay::reexports::wayland_server::Display;
 
-struct State;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
+    let display: Display<State> = Display::new()?;
 
-struct ClientState;
+    let mut state = State::new(&mut event_loop, display);
 
-impl ClientData for ClientState {
-    fn initialized(&self, _: ClientId) {}
-    fn disconnected(&self, _: ClientId, _: DisconnectReason) {}
-}
+    // Open a Wayland/X11 window for our nested compositor
+    crate::winit::init_winit(&mut event_loop, &mut state)?;
 
-fn main() {
-    let mut event_loop: EventLoop<State> = EventLoop::try_new().unwrap();
-    let mut display: Display<State> = Display::new().unwrap();
-    let dh = display.handle();
+    println!(
+        "Compositor listening on Wayland socket: {:?}",
+        state.socket_name
+    );
 
-    let socket = ListeningSocket::bind_auto("wayland", 1..33).unwrap();
-    println!("Listening on {:?}", socket.socket_name());
+    event_loop.run(None, &mut state, move |_| {})?;
 
-    let mut dh_clone = dh.clone();
-    event_loop
-        .handle()
-        .insert_source(
-            Generic::new(socket, Interest::READ, Mode::Level),
-            move |_, socket, _| {
-                while let Some(client) = socket.accept().unwrap() {
-                    dh_clone.insert_client(client, Arc::new(ClientState)).unwrap();
-                }
-                Ok(PostAction::Continue)
-            },
-        )
-        .unwrap();
-
-    let mut state = State;
-
-    loop {
-        event_loop
-            .dispatch(std::time::Duration::from_millis(16), &mut state)
-            .unwrap();
-        display.dispatch_clients(&mut state).unwrap();
-        display.flush_clients().unwrap();
-    }
+    Ok(())
 }
