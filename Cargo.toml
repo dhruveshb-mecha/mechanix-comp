@@ -1,21 +1,10 @@
 [workspace]
 members = ["."]
 
-[workspace.dependencies]
-app = { path = "../crates/app" }
-io-ring = { path = "../crates/io-ring" }
-wayland = { path = "../crates/wayland" }
-renderer = { path = "../crates/renderer" }
-
 [package]
 name = "compositor"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-app.workspace = true
-io-ring.workspace = true
-libc = "0.2"
-wayland = { workspace = true, features = ["server", "client"] }
-renderer.workspace = true
-smallvec = { version = "1.8.0", features = ["const_generics", "const_new", "union"] }
+smithay = { version = "0.7", default-features = false, features = ["wayland_frontend"] }
