@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-smithay = { version = "0.7", default-features = false, features = [
+smithay = { git = "https://github.com/Smithay/smithay", branch = "master", default-features = false, features = [
     "backend_winit",
     "wayland_frontend",
     "desktop",

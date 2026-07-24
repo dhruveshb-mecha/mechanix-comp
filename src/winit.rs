@@ -33,6 +33,7 @@ pub fn init_winit(
             subpixel: Subpixel::Unknown,
             make: "Smithay".into(),
             model: "Winit".into(),
+            serial_number: "0".into(),
         },
     );
     let _global = output.create_global::<State>(&state.display_handle);
