@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use smithay::desktop::{Space, Window};
+use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::{
     EventLoop, Interest, LoopSignal, Mode, PostAction, generic::Generic,
 };
@@ -10,6 +11,7 @@ use smithay::reexports::wayland_server::backend::{ClientData, ClientId, Disconne
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::output::OutputManagerState;
+use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
 
@@ -25,6 +27,10 @@ pub struct State {
     pub compositor_state: CompositorState,
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
+    pub data_device_state: DataDeviceState,
+    pub seat_state: SeatState<State>,
+
+    pub seat: Seat<Self>,
 }
 
 impl State {
@@ -36,6 +42,11 @@ impl State {
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let space = Space::default();
+        let data_device_state = DataDeviceState::new::<Self>(&dh);
+        let mut seat_state = SeatState::new();
+        let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "winit");
+        seat.add_keyboard(Default::default(), 200, 25).unwrap();
+        seat.add_pointer();
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
@@ -49,6 +60,9 @@ impl State {
             compositor_state,
             shm_state,
             output_manager_state,
+            data_device_state,
+            seat_state,
+            seat,
         }
     }
 

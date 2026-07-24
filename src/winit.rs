@@ -63,7 +63,7 @@ pub fn init_winit(
                     None,
                 );
             }
-            WinitEvent::Input(_event) => {}
+            WinitEvent::Input(event) => state.process_input_event(event),
             WinitEvent::Redraw => {
                 let size = backend.window_size();
                 let damage = Rectangle::from_size(size);
