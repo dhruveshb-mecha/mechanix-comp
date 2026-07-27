@@ -2,6 +2,9 @@ use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Instant;
 
+use smithay::backend::renderer::ImportDma;
+use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::winit::WinitGraphicsBackend;
 use smithay::desktop::{Space, Window};
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::{
@@ -10,8 +13,11 @@ use smithay::reexports::calloop::{
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
+use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
+use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
 
@@ -25,20 +31,39 @@ pub struct State {
 
     // Smithay State
     pub compositor_state: CompositorState,
+    pub xdg_shell_state: XdgShellState,
+    pub layer_shell_state: WlrLayerShellState,
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
     pub data_device_state: DataDeviceState,
     pub seat_state: SeatState<State>,
 
     pub seat: Seat<Self>,
+
+    // Rendering backend + dmabuf import
+    pub backend: WinitGraphicsBackend<GlesRenderer>,
+    pub dmabuf_state: DmabufState,
+    pub dmabuf_global: DmabufGlobal,
 }
 
 impl State {
-    pub fn new(event_loop: &mut EventLoop<Self>, display: Display<Self>) -> Self {
+    pub fn new(
+        event_loop: &mut EventLoop<Self>,
+        display: Display<Self>,
+        mut backend: WinitGraphicsBackend<GlesRenderer>,
+    ) -> Self {
         let start_time = Instant::now();
         let dh = display.handle();
 
+        // Advertise zwp_linux_dmabuf_v1 (v3) with the formats the GLES renderer
+        // can import. Dispatch is handled by the blanket `delegate_dispatch2!`.
+        let dmabuf_formats = backend.renderer().dmabuf_formats();
+        let mut dmabuf_state = DmabufState::new();
+        let dmabuf_global = dmabuf_state.create_global::<Self>(&dh, dmabuf_formats);
+
         let compositor_state = CompositorState::new::<Self>(&dh);
+        let xdg_shell_state = XdgShellState::new::<Self>(&dh);
+        let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let space = Space::default();
@@ -58,11 +83,16 @@ impl State {
             space,
             loop_signal,
             compositor_state,
+            xdg_shell_state,
+            layer_shell_state,
             shm_state,
             output_manager_state,
             data_device_state,
             seat_state,
             seat,
+            backend,
+            dmabuf_state,
+            dmabuf_global,
         }
     }
 

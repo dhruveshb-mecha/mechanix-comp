@@ -3,29 +3,68 @@ use smithay::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
         KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
     },
-    desktop::WindowSurfaceType,
+    desktop::{WindowSurfaceType, layer_map_for_output},
     input::{
         keyboard::FilterResult,
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, SERIAL_COUNTER},
+    wayland::shell::wlr_layer::Layer as WlrLayer,
 };
 
 use crate::state::State;
 
 impl State {
+    /// Find the surface (and its location) under `pos`, in z-order:
+    /// Overlay/Top layer surfaces first, then `Space` toplevels, then
+    /// Bottom/Background layer surfaces. Layer surfaces live in the output's
+    /// `LayerMap`, so they are missed by `Space::element_under` alone.
     pub fn surface_under(
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.space
-            .element_under(pos)
-            .and_then(|(window, location)| {
-                window
-                    .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                    .map(|(s, p)| (s, (p + location).to_f64()))
-            })
+        let output = self.space.outputs().next()?;
+        let output_geo = self.space.output_geometry(output)?;
+        let map = layer_map_for_output(output);
+
+        let layer_surface_under = |layer: &smithay::desktop::LayerSurface| {
+            let layer_loc = map.layer_geometry(layer).unwrap().loc;
+            layer
+                .surface_under(
+                    pos - output_geo.loc.to_f64() - layer_loc.to_f64(),
+                    WindowSurfaceType::ALL,
+                )
+                .map(|(surface, loc)| (surface, (loc + layer_loc + output_geo.loc).to_f64()))
+        };
+
+        if let Some(layer) = map
+            .layer_under(WlrLayer::Overlay, pos - output_geo.loc.to_f64())
+            .or_else(|| map.layer_under(WlrLayer::Top, pos - output_geo.loc.to_f64()))
+        {
+            if let Some(found) = layer_surface_under(layer) {
+                return Some(found);
+            }
+        }
+
+        if let Some(found) = self.space.element_under(pos).and_then(|(window, location)| {
+            window
+                .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
+                .map(|(s, p)| (s, (p + location).to_f64()))
+        }) {
+            return Some(found);
+        }
+
+        if let Some(layer) = map
+            .layer_under(WlrLayer::Bottom, pos - output_geo.loc.to_f64())
+            .or_else(|| map.layer_under(WlrLayer::Background, pos - output_geo.loc.to_f64()))
+        {
+            if let Some(found) = layer_surface_under(layer) {
+                return Some(found);
+            }
+        }
+
+        None
     }
 
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
@@ -79,10 +118,40 @@ impl State {
                 let button_state = event.state();
 
                 if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
-                    if let Some((window, _loc)) = self
-                        .space
-                        .element_under(pointer.current_location())
-                        .map(|(w, l)| (w.clone(), l))
+                    let pos = pointer.current_location();
+
+                    // An Overlay/Top layer surface sits above every toplevel, so
+                    // it wins the click. `Some(Some(surface))` = focusable layer
+                    // (OnDemand/Exclusive), `Some(None)` = a layer that declines
+                    // keyboard focus (leave focus where it is), `None` = no layer
+                    // there, fall through to the toplevels.
+                    let top_layer_focus: Option<Option<WlSurface>> =
+                        self.space.outputs().next().cloned().and_then(|output| {
+                            let output_geo = self.space.output_geometry(&output)?;
+                            let map = layer_map_for_output(&output);
+                            map.layer_under(WlrLayer::Overlay, pos - output_geo.loc.to_f64())
+                                .or_else(|| {
+                                    map.layer_under(WlrLayer::Top, pos - output_geo.loc.to_f64())
+                                })
+                                .map(|layer| {
+                                    layer
+                                        .can_receive_keyboard_focus()
+                                        .then(|| layer.wl_surface().clone())
+                                })
+                        });
+
+                    if let Some(focus) = top_layer_focus {
+                        // Only a layer surface that requested keyboard input
+                        // steals focus; a bare panel/wallpaper does not.
+                        if let Some(surface) = focus {
+                            self.space.elements().for_each(|window| {
+                                window.set_activated(false);
+                                window.toplevel().unwrap().send_pending_configure();
+                            });
+                            keyboard.set_focus(self, Some(surface), serial);
+                        }
+                    } else if let Some((window, _loc)) =
+                        self.space.element_under(pos).map(|(w, l)| (w.clone(), l))
                     {
                         self.space.raise_element(&window, true);
                         keyboard.set_focus(

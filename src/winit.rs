@@ -3,11 +3,13 @@ use std::time::Duration;
 use smithay::{
     backend::{
         renderer::{
-            damage::OutputDamageTracker, element::surface::WaylandSurfaceRenderElement,
+            damage::OutputDamageTracker,
+            element::surface::WaylandSurfaceRenderElement,
             gles::GlesRenderer,
         },
-        winit::{self, WinitEvent},
+        winit::{WinitEvent, WinitEventLoop},
     },
+    desktop::layer_map_for_output,
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::calloop::EventLoop,
     utils::{Rectangle, Transform},
@@ -18,11 +20,10 @@ use crate::state::State;
 pub fn init_winit(
     event_loop: &mut EventLoop<State>,
     state: &mut State,
+    winit: WinitEventLoop,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut backend, winit) = winit::init()?;
-
     let mode = Mode {
-        size: backend.window_size(),
+        size: state.backend.window_size(),
         refresh: 60_000,
     };
 
@@ -62,14 +63,24 @@ pub fn init_winit(
                     None,
                     None,
                 );
+
+                // Re-arrange layer surfaces for the new output size, then keep
+                // every open toplevel filling the (possibly changed)
+                // non-exclusive zone.
+                layer_map_for_output(&output).arrange();
+                state.reflow_toplevels();
             }
             WinitEvent::Input(event) => state.process_input_event(event),
             WinitEvent::Redraw => {
-                let size = backend.window_size();
+                let size = state.backend.window_size();
                 let damage = Rectangle::from_size(size);
 
                 {
-                    let (renderer, mut framebuffer) = backend.bind().unwrap();
+                    let (renderer, mut framebuffer) = state.backend.bind().unwrap();
+                    // `render_output` (via `space_render_elements`) already draws
+                    // the output's layer surfaces in z-order — Top/Overlay above
+                    // the space windows, Background/Bottom below — so xdg and
+                    // layer shell compose correctly with a single call.
                     smithay::desktop::space::render_output::<
                         _,
                         WaylandSurfaceRenderElement<GlesRenderer>,
@@ -88,7 +99,7 @@ pub fn init_winit(
                     )
                     .unwrap();
                 }
-                backend.submit(Some(&[damage])).unwrap();
+                state.backend.submit(Some(&[damage])).unwrap();
 
                 state.space.elements().for_each(|window| {
                     window.send_frame(
@@ -99,10 +110,19 @@ pub fn init_winit(
                     )
                 });
 
+                for layer_surface in layer_map_for_output(&output).layers() {
+                    layer_surface.send_frame(
+                        &output,
+                        state.start_time.elapsed(),
+                        Some(Duration::ZERO),
+                        |_, _| Some(output.clone()),
+                    );
+                }
+
                 state.space.refresh();
                 let _ = state.display_handle.flush_clients();
 
-                backend.window().request_redraw();
+                state.backend.window().request_redraw();
             }
             WinitEvent::CloseRequested => {
                 state.loop_signal.stop();
