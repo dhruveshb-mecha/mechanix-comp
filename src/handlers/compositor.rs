@@ -1,6 +1,5 @@
 use crate::state::State;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
-use smithay::delegate_compositor;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::compositor::{CompositorHandler, CompositorState};
 
@@ -23,5 +22,3 @@ impl CompositorHandler for State {
         on_commit_buffer_handler::<Self>(surface);
     }
 }
-
-delegate_compositor!(State);
