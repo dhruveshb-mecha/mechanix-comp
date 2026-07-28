@@ -1,5 +1,5 @@
 use crate::state::State;
-use smithay::desktop::{LayerSurface, WindowSurfaceType, layer_map_for_output};
+use smithay::desktop::{LayerSurface, PopupKind, WindowSurfaceType, layer_map_for_output};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -9,6 +9,7 @@ use smithay::wayland::shell::wlr_layer::{
     Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData, WlrLayerShellHandler,
     WlrLayerShellState,
 };
+use smithay::wayland::shell::xdg::PopupSurface;
 
 impl WlrLayerShellHandler for State {
     fn shell_state(&mut self) -> &mut WlrLayerShellState {
@@ -33,7 +34,8 @@ impl WlrLayerShellHandler for State {
             .or_else(|| self.space.outputs().next().cloned());
         if let Some(output) = output {
             let mut map = layer_map_for_output(&output);
-            map.map_layer(&LayerSurface::new(surface, namespace)).unwrap();
+            map.map_layer(&LayerSurface::new(surface, namespace))
+                .unwrap();
         }
     }
 
@@ -49,6 +51,13 @@ impl WlrLayerShellHandler for State {
         }) {
             map.unmap_layer(&layer);
         }
+    }
+
+    fn new_popup(&mut self, _parent: WlrLayerSurface, popup: PopupSurface) {
+        eprintln!("[layer_shell] new_popup called: {:?}", popup.wl_surface());
+        self.unconstrain_layer_popup(&popup);
+        let _ = self.popups.track_popup(PopupKind::Xdg(popup));
+        eprintln!("[layer_shell] popup tracked");
     }
 }
 
