@@ -26,6 +26,24 @@ impl State {
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
         let output = self.space.outputs().next()?;
         let output_geo = self.space.output_geometry(output)?;
+
+        if self.is_locked {
+            // Find if the pos is within any lock surface.
+            for lock_surface in self.lock_surfaces.iter().filter(|s| s.alive()) {
+                let surface = lock_surface.wl_surface();
+                if let Some((s, p)) = smithay::desktop::utils::under_from_surface_tree(
+                    surface,
+                    pos - output_geo.loc.to_f64(),
+                    (0, 0),
+                    WindowSurfaceType::ALL,
+                ) {
+                    return Some((s.clone(), p.to_f64() + output_geo.loc.to_f64()));
+                }
+            }
+            // If locked, don't fall through to other surfaces.
+            return None;
+        }
+
         let map = layer_map_for_output(output);
 
         let layer_surface_under = |layer: &smithay::desktop::LayerSurface| {
@@ -41,27 +59,29 @@ impl State {
         if let Some(layer) = map
             .layer_under(WlrLayer::Overlay, pos - output_geo.loc.to_f64())
             .or_else(|| map.layer_under(WlrLayer::Top, pos - output_geo.loc.to_f64()))
+            && let Some(found) = layer_surface_under(layer)
         {
-            if let Some(found) = layer_surface_under(layer) {
-                return Some(found);
-            }
+            return Some(found);
         }
 
-        if let Some(found) = self.space.element_under(pos).and_then(|(window, location)| {
-            window
-                .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                .map(|(s, p)| (s, (p + location).to_f64()))
-        }) {
+        if let Some(found) = self
+            .space
+            .element_under(pos)
+            .and_then(|(window, location)| {
+                window
+                    .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
+                    .map(|(s, p)| (s, (p + location).to_f64()))
+            })
+        {
             return Some(found);
         }
 
         if let Some(layer) = map
             .layer_under(WlrLayer::Bottom, pos - output_geo.loc.to_f64())
             .or_else(|| map.layer_under(WlrLayer::Background, pos - output_geo.loc.to_f64()))
+            && let Some(found) = layer_surface_under(layer)
         {
-            if let Some(found) = layer_surface_under(layer) {
-                return Some(found);
-            }
+            return Some(found);
         }
 
         None
@@ -119,55 +139,63 @@ impl State {
 
                 if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
                     let pos = pointer.current_location();
+                    if self.is_locked {
+                        if let Some((surface, _)) = self.surface_under(pos) {
+                            keyboard.set_focus(self, Some(surface), serial);
+                        }
+                    } else {
+                        // An Overlay/Top layer surface sits above every toplevel, so
+                        // it wins the click. `Some(Some(surface))` = focusable layer
+                        // (OnDemand/Exclusive), `Some(None)` = a layer that declines
+                        // keyboard focus (leave focus where it is), `None` = no layer
+                        // there, fall through to the toplevels.
+                        let top_layer_focus: Option<Option<WlSurface>> =
+                            self.space.outputs().next().cloned().and_then(|output| {
+                                let output_geo = self.space.output_geometry(&output)?;
+                                let map = layer_map_for_output(&output);
+                                map.layer_under(WlrLayer::Overlay, pos - output_geo.loc.to_f64())
+                                    .or_else(|| {
+                                        map.layer_under(
+                                            WlrLayer::Top,
+                                            pos - output_geo.loc.to_f64(),
+                                        )
+                                    })
+                                    .map(|layer| {
+                                        layer
+                                            .can_receive_keyboard_focus()
+                                            .then(|| layer.wl_surface().clone())
+                                    })
+                            });
 
-                    // An Overlay/Top layer surface sits above every toplevel, so
-                    // it wins the click. `Some(Some(surface))` = focusable layer
-                    // (OnDemand/Exclusive), `Some(None)` = a layer that declines
-                    // keyboard focus (leave focus where it is), `None` = no layer
-                    // there, fall through to the toplevels.
-                    let top_layer_focus: Option<Option<WlSurface>> =
-                        self.space.outputs().next().cloned().and_then(|output| {
-                            let output_geo = self.space.output_geometry(&output)?;
-                            let map = layer_map_for_output(&output);
-                            map.layer_under(WlrLayer::Overlay, pos - output_geo.loc.to_f64())
-                                .or_else(|| {
-                                    map.layer_under(WlrLayer::Top, pos - output_geo.loc.to_f64())
-                                })
-                                .map(|layer| {
-                                    layer
-                                        .can_receive_keyboard_focus()
-                                        .then(|| layer.wl_surface().clone())
-                                })
-                        });
-
-                    if let Some(focus) = top_layer_focus {
-                        // Only a layer surface that requested keyboard input
-                        // steals focus; a bare panel/wallpaper does not.
-                        if let Some(surface) = focus {
+                        if let Some(focus) = top_layer_focus {
+                            // Only a layer surface that requested keyboard input
+                            // steals focus; a bare panel/wallpaper does not.
+                            if let Some(surface) = focus {
+                                self.space.elements().for_each(|window| {
+                                    window.set_activated(false);
+                                    window.toplevel().unwrap().send_pending_configure();
+                                });
+                                keyboard.set_focus(self, Some(surface), serial);
+                            }
+                        } else if let Some((window, _loc)) =
+                            self.space.element_under(pos).map(|(w, l)| (w.clone(), l))
+                        {
+                            self.space.raise_element(&window, true);
+                            keyboard.set_focus(
+                                self,
+                                Some(window.toplevel().unwrap().wl_surface().clone()),
+                                serial,
+                            );
+                            self.space.elements().for_each(|window| {
+                                window.toplevel().unwrap().send_pending_configure();
+                            });
+                        } else {
                             self.space.elements().for_each(|window| {
                                 window.set_activated(false);
                                 window.toplevel().unwrap().send_pending_configure();
                             });
-                            keyboard.set_focus(self, Some(surface), serial);
+                            keyboard.set_focus(self, Option::<WlSurface>::None, serial);
                         }
-                    } else if let Some((window, _loc)) =
-                        self.space.element_under(pos).map(|(w, l)| (w.clone(), l))
-                    {
-                        self.space.raise_element(&window, true);
-                        keyboard.set_focus(
-                            self,
-                            Some(window.toplevel().unwrap().wl_surface().clone()),
-                            serial,
-                        );
-                        self.space.elements().for_each(|window| {
-                            window.toplevel().unwrap().send_pending_configure();
-                        });
-                    } else {
-                        self.space.elements().for_each(|window| {
-                            window.set_activated(false);
-                            window.toplevel().unwrap().send_pending_configure();
-                        });
-                        keyboard.set_focus(self, Option::<WlSurface>::None, serial);
                     }
                 };
 
