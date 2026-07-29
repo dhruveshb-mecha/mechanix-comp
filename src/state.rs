@@ -16,6 +16,7 @@ use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::session_lock::{LockSurface, SessionLockManagerState, SessionLocker};
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
@@ -44,6 +45,13 @@ pub struct State {
     pub backend: WinitGraphicsBackend<GlesRenderer>,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: DmabufGlobal,
+
+    pub session_lock_state: SessionLockManagerState,
+    pub is_locked: bool,
+    pub lock_surfaces: Vec<LockSurface>,
+    /// Held between `lock()` and the first submitted locked frame.
+    /// Calling `.lock()` on this sends the `locked` event to the client.
+    pub pending_lock: Option<SessionLocker>,
 }
 
 impl State {
@@ -73,6 +81,8 @@ impl State {
         seat.add_keyboard(Default::default(), 200, 25).unwrap();
         seat.add_pointer();
 
+        let session_lock_state = SessionLockManagerState::new::<Self, _>(&dh, |_| true);
+
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
 
@@ -93,6 +103,10 @@ impl State {
             backend,
             dmabuf_state,
             dmabuf_global,
+            session_lock_state,
+            is_locked: false,
+            lock_surfaces: Vec::new(),
+            pending_lock: None,
         }
     }
 
