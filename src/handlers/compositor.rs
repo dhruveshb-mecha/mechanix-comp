@@ -1,6 +1,7 @@
 use crate::handlers::{layer_shell, xdg_shell};
 use crate::state::State;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
+use smithay::desktop::PopupKind;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::compositor::{
     CompositorHandler, CompositorState, get_parent, is_sync_subsurface,
@@ -24,6 +25,8 @@ impl CompositorHandler for State {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
+        let mut child_to_center: Option<smithay::desktop::Window> = None;
+
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {
@@ -33,17 +36,40 @@ impl CompositorHandler for State {
                 .space
                 .elements()
                 .find(|w| w.toplevel().unwrap().wl_surface() == &root)
+                .cloned()
             {
                 window.on_commit();
+
+                if window.toplevel().unwrap().parent().is_some() {
+                    child_to_center = Some(window);
+                }
             }
         }
 
-        // Layer surfaces live in a per-output `LayerMap`, not the `Space`; if
-        // this commit was for one, it's fully handled there.
+        self.popups.commit(surface);
+        if let Some(popup) = self.popups.find_popup(surface) {
+            if let PopupKind::Xdg(ref xdg) = popup {
+                eprintln!(
+                    "[commit] xdg popup found, needs_configure={}",
+                    !xdg.is_initial_configure_sent()
+                );
+                if !xdg.is_initial_configure_sent() {
+                    xdg.send_configure().expect("initial configure failed");
+                }
+            }
+        }
+
         if layer_shell::handle_commit(self, surface) {
+            if let Some(window) = child_to_center {
+                self.center_child_toplevel(&window);
+            }
             return;
         }
 
-        xdg_shell::handle_commit(&self.space, surface);
+        xdg_shell::handle_commit(self, surface);
+
+        if let Some(window) = child_to_center {
+            self.center_child_toplevel(&window);
+        }
     }
 }

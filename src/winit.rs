@@ -168,6 +168,7 @@ pub fn init_winit(
                 }
 
                 state.space.refresh();
+                state.popups.cleanup();
                 let _ = state.display_handle.flush_clients();
 
                 state.backend.window().request_redraw();

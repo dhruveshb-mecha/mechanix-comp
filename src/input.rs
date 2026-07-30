@@ -59,9 +59,15 @@ impl State {
         if let Some(layer) = map
             .layer_under(WlrLayer::Overlay, pos - output_geo.loc.to_f64())
             .or_else(|| map.layer_under(WlrLayer::Top, pos - output_geo.loc.to_f64()))
-            && let Some(found) = layer_surface_under(layer)
         {
-            return Some(found);
+            if let Some(found) = layer_surface_under(layer) {
+                return Some(found);
+            }
+            let layer_loc = map.layer_geometry(layer).unwrap().loc;
+            return Some((
+                layer.wl_surface().clone(),
+                (layer_loc + output_geo.loc).to_f64(),
+            ));
         }
 
         if let Some(found) = self
@@ -79,9 +85,15 @@ impl State {
         if let Some(layer) = map
             .layer_under(WlrLayer::Bottom, pos - output_geo.loc.to_f64())
             .or_else(|| map.layer_under(WlrLayer::Background, pos - output_geo.loc.to_f64()))
-            && let Some(found) = layer_surface_under(layer)
         {
-            return Some(found);
+            if let Some(found) = layer_surface_under(layer) {
+                return Some(found);
+            }
+            let layer_loc = map.layer_geometry(layer).unwrap().loc;
+            return Some((
+                layer.wl_surface().clone(),
+                (layer_loc + output_geo.loc).to_f64(),
+            ));
         }
 
         None
@@ -186,8 +198,9 @@ impl State {
                                 Some(window.toplevel().unwrap().wl_surface().clone()),
                                 serial,
                             );
-                            self.space.elements().for_each(|window| {
-                                window.toplevel().unwrap().send_pending_configure();
+                            self.space.elements().for_each(|w| {
+                                w.set_activated(w == &window);
+                                w.toplevel().unwrap().send_pending_configure();
                             });
                         } else {
                             self.space.elements().for_each(|window| {
