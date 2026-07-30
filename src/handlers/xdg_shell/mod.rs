@@ -2,9 +2,10 @@ pub mod decoration;
 
 use crate::state::State;
 use smithay::desktop::{
-    PopupKind, Space, Window, WindowSurfaceType, find_popup_root_surface,
-    get_popup_toplevel_coords, layer_map_for_output,
+    PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Space, Window,
+    WindowSurfaceType, find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output,
 };
+use smithay::input::{Seat, pointer::Focus};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::{wl_seat, wl_surface::WlSurface};
 use smithay::utils::{Point, SERIAL_COUNTER, Serial};
@@ -62,8 +63,38 @@ impl XdgShellHandler for State {
         let _ = self.popups.track_popup(PopupKind::Xdg(surface));
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
-        // DEPENDS ON: popup grab implementation (PopupPointerGrab, PopupKeyboardGrab)
+    fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        let seat = Seat::from_resource(&seat).unwrap();
+        let kind = PopupKind::Xdg(surface);
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            return;
+        };
+
+        let ret = self.popups.grab_popup(root, kind, &seat, serial);
+
+        if let Ok(mut grab) = ret {
+            if let Some(keyboard) = seat.get_keyboard() {
+                if keyboard.is_grabbed()
+                    && !(keyboard.has_grab(serial)
+                        || grab.previous_serial().is_none_or(|s| keyboard.has_grab(s)))
+                {
+                    grab.ungrab(PopupUngrabStrategy::All);
+                    return;
+                }
+                keyboard.set_focus(self, grab.current_grab(), serial);
+                keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+            }
+            if let Some(pointer) = seat.get_pointer() {
+                if pointer.is_grabbed()
+                    && !(pointer.has_grab(serial)
+                        || grab.previous_serial().is_none_or(|s| pointer.has_grab(s)))
+                {
+                    grab.ungrab(PopupUngrabStrategy::All);
+                    return;
+                }
+                pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+            }
+        }
     }
 
     fn reposition_request(

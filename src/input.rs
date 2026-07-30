@@ -64,7 +64,10 @@ impl State {
                 return Some(found);
             }
             let layer_loc = map.layer_geometry(layer).unwrap().loc;
-            return Some((layer.wl_surface().clone(), (layer_loc + output_geo.loc).to_f64()));
+            return Some((
+                layer.wl_surface().clone(),
+                (layer_loc + output_geo.loc).to_f64(),
+            ));
         }
 
         if let Some(found) = self
@@ -87,7 +90,10 @@ impl State {
                 return Some(found);
             }
             let layer_loc = map.layer_geometry(layer).unwrap().loc;
-            return Some((layer.wl_surface().clone(), (layer_loc + output_geo.loc).to_f64()));
+            return Some((
+                layer.wl_surface().clone(),
+                (layer_loc + output_geo.loc).to_f64(),
+            ));
         }
 
         None
