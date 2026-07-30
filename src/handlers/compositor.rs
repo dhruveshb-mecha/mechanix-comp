@@ -66,7 +66,7 @@ impl CompositorHandler for State {
             return;
         }
 
-        xdg_shell::handle_commit(&self.space, surface);
+        xdg_shell::handle_commit(self, surface);
 
         if let Some(window) = child_to_center {
             self.center_child_toplevel(&window);

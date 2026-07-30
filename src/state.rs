@@ -10,6 +10,7 @@ use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::{
     EventLoop, Interest, LoopSignal, Mode, PostAction, generic::Generic,
 };
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
@@ -22,6 +23,7 @@ use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
+use smithay::wayland::xdg_activation::XdgActivationState;
 
 pub struct State {
     pub start_time: Instant,
@@ -36,6 +38,7 @@ pub struct State {
     pub xdg_shell_state: XdgShellState,
     pub xdg_decoration_state: XdgDecorationState,
     pub layer_shell_state: WlrLayerShellState,
+    pub xdg_activation_state: XdgActivationState,
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
     pub data_device_state: DataDeviceState,
@@ -73,9 +76,16 @@ impl State {
         let dmabuf_global = dmabuf_state.create_global::<Self>(&dh, dmabuf_formats);
 
         let compositor_state = CompositorState::new::<Self>(&dh);
-        let xdg_shell_state = XdgShellState::new::<Self>(&dh);
+        let xdg_shell_state = XdgShellState::new_with_capabilities::<Self>(
+            &dh,
+            [
+                xdg_toplevel::WmCapabilities::Maximize,
+                xdg_toplevel::WmCapabilities::Fullscreen,
+            ],
+        );
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
+        let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let space = Space::default();
@@ -101,6 +111,7 @@ impl State {
             xdg_shell_state,
             xdg_decoration_state,
             layer_shell_state,
+            xdg_activation_state,
             shm_state,
             output_manager_state,
             data_device_state,

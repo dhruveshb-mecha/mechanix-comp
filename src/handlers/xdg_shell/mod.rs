@@ -2,12 +2,12 @@ pub mod decoration;
 
 use crate::state::State;
 use smithay::desktop::{
-    PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Space, Window,
-    WindowSurfaceType, find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output,
+    PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window, WindowSurfaceType,
+    find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output,
 };
 use smithay::input::{Seat, pointer::Focus};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
-use smithay::reexports::wayland_server::protocol::{wl_seat, wl_surface::WlSurface};
+use smithay::reexports::wayland_server::protocol::{wl_output, wl_seat, wl_surface::WlSurface};
 use smithay::utils::{Point, SERIAL_COUNTER, Serial};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::{
@@ -113,7 +113,6 @@ impl XdgShellHandler for State {
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
         if surface.parent().is_some() {
-            surface.send_configure();
             return;
         }
         let zone = self
@@ -124,6 +123,62 @@ impl XdgShellHandler for State {
         if let Some(zone) = zone {
             surface.with_pending_state(|state| {
                 state.size = Some(zone.size);
+                state.states.set(xdg_toplevel::State::Maximized);
+            });
+        }
+        surface.send_configure();
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        // Windows cannot be un-maximized. Re-confirm maximized state.
+        let zone = self
+            .space
+            .outputs()
+            .next()
+            .map(|o| layer_map_for_output(o).non_exclusive_zone());
+        if let Some(zone) = zone {
+            surface.with_pending_state(|state| {
+                state.size = Some(zone.size);
+                state.states.set(xdg_toplevel::State::Maximized);
+            });
+        }
+        surface.send_configure();
+    }
+
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _output: Option<wl_output::WlOutput>,
+    ) {
+        if surface.parent().is_some() {
+            return;
+        }
+        let output_geo = self
+            .space
+            .outputs()
+            .next()
+            .and_then(|o| self.space.output_geometry(o));
+        if let Some(geo) = output_geo {
+            surface.with_pending_state(|state| {
+                state.size = Some(geo.size);
+                state.states.set(xdg_toplevel::State::Fullscreen);
+            });
+        }
+        surface.send_configure();
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        // Return to maximized state.
+        let zone = self
+            .space
+            .outputs()
+            .next()
+            .map(|o| layer_map_for_output(o).non_exclusive_zone());
+        if let Some(zone) = zone {
+            surface.with_pending_state(|state| {
+                state.size = Some(zone.size);
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+                state.states.set(xdg_toplevel::State::Maximized);
             });
         }
         surface.send_configure();
@@ -294,8 +349,9 @@ impl State {
     }
 }
 
-pub fn handle_commit(space: &Space<Window>, surface: &WlSurface) {
-    if let Some(window) = space
+pub fn handle_commit(state: &mut State, surface: &WlSurface) {
+    if let Some(window) = state
+        .space
         .elements()
         .find(|w| w.toplevel().unwrap().wl_surface() == surface)
     {
@@ -310,7 +366,23 @@ pub fn handle_commit(space: &Space<Window>, surface: &WlSurface) {
         });
 
         if !initial_configure_sent {
-            window.toplevel().unwrap().send_configure();
+            let toplevel = window.toplevel().unwrap();
+            if toplevel.parent().is_none() {
+                // Auto-maximize non-dialog toplevels on first commit.
+                // By now set_parent() has been called if this is a dialog.
+                let zone = state
+                    .space
+                    .outputs()
+                    .next()
+                    .map(|o| layer_map_for_output(o).non_exclusive_zone());
+                if let Some(zone) = zone {
+                    toplevel.with_pending_state(|pending| {
+                        pending.size = Some(zone.size);
+                        pending.states.set(xdg_toplevel::State::Maximized);
+                    });
+                }
+            }
+            toplevel.send_configure();
         }
     }
 }
