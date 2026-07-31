@@ -1,3 +1,4 @@
+use crate::backend::Backend;
 use crate::state::State;
 use smithay::desktop::{LayerSurface, PopupKind, WindowSurfaceType, layer_map_for_output};
 use smithay::output::Output;
@@ -11,7 +12,7 @@ use smithay::wayland::shell::wlr_layer::{
 };
 use smithay::wayland::shell::xdg::PopupSurface;
 
-impl WlrLayerShellHandler for State {
+impl<BackendData: Backend + 'static> WlrLayerShellHandler for State<BackendData> {
     fn shell_state(&mut self) -> &mut WlrLayerShellState {
         &mut self.layer_shell_state
     }
@@ -61,7 +62,7 @@ impl WlrLayerShellHandler for State {
     }
 }
 
-impl State {
+impl<BackendData: Backend + 'static> State<BackendData> {
     /// Give keyboard focus to a layer surface. Layer surfaces are their own
     /// keyboard-focus target (`KeyboardFocus = WlSurface`), so this is a plain
     /// `set_focus` on the surface.
@@ -77,7 +78,10 @@ impl State {
 /// once the surface is configured and its interactivity is known — grabs
 /// keyboard focus if the surface requested it. Returns `true` if `surface` was
 /// a layer surface (so the caller can skip the toplevel path).
-pub fn handle_commit(state: &mut State, surface: &WlSurface) -> bool {
+pub fn handle_commit<BackendData: Backend + 'static>(
+    state: &mut State<BackendData>,
+    surface: &WlSurface,
+) -> bool {
     let Some(output) = state
         .space
         .outputs()

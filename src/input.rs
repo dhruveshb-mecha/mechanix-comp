@@ -13,9 +13,10 @@ use smithay::{
     wayland::shell::wlr_layer::Layer as WlrLayer,
 };
 
+use crate::backend::Backend;
 use crate::state::State;
 
-impl State {
+impl<BackendData: Backend + 'static> State<BackendData> {
     /// Find the surface (and its location) under `pos`, in z-order:
     /// Overlay/Top layer surfaces first, then `Space` toplevels, then
     /// Bottom/Background layer surfaces. Layer surfaces live in the output's

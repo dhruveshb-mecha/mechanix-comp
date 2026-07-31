@@ -1,10 +1,11 @@
+use crate::backend::Backend;
 use crate::state::State;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::xdg_activation::{
     XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
 };
 
-impl XdgActivationHandler for State {
+impl<BackendData: Backend + 'static> XdgActivationHandler for State<BackendData> {
     fn activation_state(&mut self) -> &mut XdgActivationState {
         &mut self.xdg_activation_state
     }

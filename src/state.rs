@@ -2,9 +2,6 @@ use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Instant;
 
-use smithay::backend::renderer::ImportDma;
-use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::winit::WinitGraphicsBackend;
 use smithay::desktop::{PopupManager, Space, Window};
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::{
@@ -25,7 +22,9 @@ use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::xdg_activation::XdgActivationState;
 
-pub struct State {
+use crate::backend::Backend;
+
+pub struct State<BackendData: Backend + 'static> {
     pub start_time: Instant,
     pub socket_name: OsString,
     pub display_handle: DisplayHandle,
@@ -42,15 +41,16 @@ pub struct State {
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
     pub data_device_state: DataDeviceState,
-    pub seat_state: SeatState<State>,
+    pub seat_state: SeatState<State<BackendData>>,
     pub popups: PopupManager,
 
     pub seat: Seat<Self>,
 
-    // Rendering backend + dmabuf import
-    pub backend: WinitGraphicsBackend<GlesRenderer>,
+    // Rendering backend + dmabuf import. The dmabuf global is created lazily by
+    // each backend once its renderer (and thus its format list) exists.
+    pub backend_data: BackendData,
     pub dmabuf_state: DmabufState,
-    pub dmabuf_global: DmabufGlobal,
+    pub dmabuf_global: Option<DmabufGlobal>,
 
     pub session_lock_state: SessionLockManagerState,
     pub is_locked: bool,
@@ -60,20 +60,21 @@ pub struct State {
     pub pending_lock: Option<SessionLocker>,
 }
 
-impl State {
+impl<BackendData: Backend + 'static> State<BackendData> {
     pub fn new(
         event_loop: &mut EventLoop<Self>,
         display: Display<Self>,
-        mut backend: WinitGraphicsBackend<GlesRenderer>,
+        backend_data: BackendData,
     ) -> Self {
         let start_time = Instant::now();
         let dh = display.handle();
 
-        // Advertise zwp_linux_dmabuf_v1 (v3) with the formats the GLES renderer
-        // can import. Dispatch is handled by the blanket `delegate_dispatch2!`.
-        let dmabuf_formats = backend.renderer().dmabuf_formats();
-        let mut dmabuf_state = DmabufState::new();
-        let dmabuf_global = dmabuf_state.create_global::<Self>(&dh, dmabuf_formats);
+        // The zwp_linux_dmabuf_v1 global is created lazily by each backend once
+        // its renderer's format list is available. Dispatch is handled by the
+        // blanket `delegate_dispatch2!`.
+        let dmabuf_state = DmabufState::new();
+
+        let seat_name = backend_data.seat_name();
 
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new_with_capabilities::<Self>(
@@ -92,7 +93,7 @@ impl State {
         let data_device_state = DataDeviceState::new::<Self>(&dh);
         let popups = PopupManager::default();
         let mut seat_state = SeatState::new();
-        let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "winit");
+        let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, seat_name);
         seat.add_keyboard(Default::default(), 200, 25).unwrap();
         seat.add_pointer();
 
@@ -118,9 +119,9 @@ impl State {
             seat_state,
             popups,
             seat,
-            backend,
+            backend_data,
             dmabuf_state,
-            dmabuf_global,
+            dmabuf_global: None,
             session_lock_state,
             is_locked: false,
             lock_surfaces: Vec::new(),
@@ -129,7 +130,7 @@ impl State {
     }
 
     fn init_wayland_listener(
-        display: Display<State>,
+        display: Display<Self>,
         event_loop: &mut EventLoop<Self>,
     ) -> OsString {
         let listening_socket = ListeningSocketSource::new_auto().unwrap();

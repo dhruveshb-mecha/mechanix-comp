@@ -1,5 +1,6 @@
 pub mod decoration;
 
+use crate::backend::Backend;
 use crate::state::State;
 use smithay::desktop::{
     PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window, WindowSurfaceType,
@@ -15,7 +16,7 @@ use smithay::wayland::shell::xdg::{
     XdgToplevelSurfaceData,
 };
 
-impl XdgShellHandler for State {
+impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
     }
@@ -185,7 +186,7 @@ impl XdgShellHandler for State {
     }
 }
 
-impl State {
+impl<BackendData: Backend + 'static> State<BackendData> {
     pub fn focus_window(&mut self, window: &Window) {
         self.space.raise_element(window, true);
 
@@ -349,7 +350,10 @@ impl State {
     }
 }
 
-pub fn handle_commit(state: &mut State, surface: &WlSurface) {
+pub fn handle_commit<BackendData: Backend + 'static>(
+    state: &mut State<BackendData>,
+    surface: &WlSurface,
+) {
     if let Some(window) = state
         .space
         .elements()
