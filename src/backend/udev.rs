@@ -114,13 +114,27 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Pick the primary GPU and normalize to its primary (card) node, which is
     // the one that carries KMS/modesetting.
-    let primary_path = primary_gpu(&session.seat())?.ok_or("no GPU found for seat")?;
+    let primary_path = if let Ok(custom_dev) = std::env::var("MECHA_DRM_DEVICE").or_else(|_| std::env::var("WLR_DRM_DEVICES")) {
+        let p = std::path::PathBuf::from(&custom_dev);
+        if p.exists() {
+            p
+        } else {
+            let candidate = std::path::PathBuf::from(format!("/dev/dri/{custom_dev}"));
+            if candidate.exists() {
+                candidate
+            } else {
+                p
+            }
+        }
+    } else {
+        primary_gpu(&session.seat())?.ok_or("no GPU found for seat")?
+    };
     let primary_node = DrmNode::from_path(&primary_path)?;
     let primary_gpu = primary_node
         .node_with_type(NodeType::Primary)
         .and_then(|n| n.ok())
         .unwrap_or(primary_node);
-    info!("Using {primary_gpu} as primary GPU");
+    info!("Using {primary_gpu} ({primary_path:?}) as primary GPU");
 
     let loop_handle = event_loop.handle();
     let udev_data = UdevData {
@@ -524,8 +538,7 @@ impl State<UdevData> {
         };
 
         if !queued {
-            // No pageflip pending, so nothing will wake us — poll again after
-            // roughly one refresh interval to pick up future damage.
+            // No pageflip pending; poll again after one refresh interval.
             let timer = Timer::from_duration(frame_duration);
             let _ = self
                 .backend_data
@@ -570,15 +583,9 @@ impl State<UdevData> {
             .cloned();
         if let Some(output) = output {
             self.send_frame_callbacks(&output);
-
-            let timer = Timer::from_duration(frame_duration(&output));
-            let _ = self
-                .backend_data
-                .loop_handle
-                .insert_source(timer, move |_, _, state| {
-                    state.render_surface(node, crtc);
-                    TimeoutAction::Drop
-                });
+            self.backend_data.loop_handle.insert_idle(move |state| {
+                state.render_surface(node, crtc);
+            });
         }
 
         let _ = self.display_handle.flush_clients();

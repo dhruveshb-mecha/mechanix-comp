@@ -154,6 +154,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     unsafe {
                         display.get_mut().dispatch_clients(state).unwrap();
                     }
+                    let _ = state.display_handle.flush_clients();
                     Ok(PostAction::Continue)
                 },
             )

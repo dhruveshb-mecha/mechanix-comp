@@ -22,19 +22,19 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        let window = Window::new_wayland_window(surface);
+        let window = Window::new_wayland_window(surface.clone());
 
         let loc = if let Some(output) = self.space.outputs().next().cloned() {
             let zone = layer_map_for_output(&output).non_exclusive_zone();
-            if window.toplevel().unwrap().parent().is_some() {
+            if surface.parent().is_some() {
                 // Dialog with a parent — constrain to the zone but don't fill
                 // it. The dialog will be centered once it commits its buffer.
-                window.toplevel().unwrap().with_pending_state(|state| {
+                surface.with_pending_state(|state| {
                     state.bounds = Some(zone.size);
                 });
                 (0, 0).into()
             } else {
-                window.toplevel().unwrap().with_pending_state(|state| {
+                surface.with_pending_state(|state| {
                     state.size = Some(zone.size);
                 });
                 zone.loc
@@ -42,6 +42,8 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         } else {
             (0, 0).into()
         };
+
+        surface.send_configure();
 
         self.space.map_element(window.clone(), loc, true);
         self.focus_window(&window);
