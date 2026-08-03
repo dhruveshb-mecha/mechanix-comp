@@ -1,21 +1,19 @@
-[workspace]
-members = ["."]
-
-[workspace.dependencies]
-app = { path = "../crates/app" }
-io-ring = { path = "../crates/io-ring" }
-wayland = { path = "../crates/wayland" }
-renderer = { path = "../crates/renderer" }
-
 [package]
 name = "compositor"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["."]
+
 [dependencies]
-app.workspace = true
-io-ring.workspace = true
-libc = "0.2"
-wayland = { workspace = true, features = ["server", "client"] }
-renderer.workspace = true
-smallvec = { version = "1.8.0", features = ["const_generics", "const_new", "union"] }
+smithay = {
+  git = "https://github.com/Smithay/smithay",
+  rev = "492497f064d786aafec3c01e03b24a2cd0d31426",
+  default-features = false,
+  features = [
+    "backend_winit",
+    "desktop",
+    "wayland_frontend",
+  ]
+}
