@@ -102,6 +102,13 @@ impl Backend for UdevData {
             surface.drm_output.reset_buffers();
         }
     }
+
+    fn change_vt(&mut self, vt: i32) {
+        info!(to = vt, "Trying to switch vt");
+        if let Err(err) = self.session.change_vt(vt) {
+            error!(vt, "Error switching vt: {}", err);
+        }
+    }
 }
 
 /// Take over the session, open the primary GPU, light up its first connected

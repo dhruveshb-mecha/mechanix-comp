@@ -1,3 +1,5 @@
+use std::process::Command;
+
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
@@ -5,13 +7,14 @@ use smithay::{
     },
     desktop::{WindowSurfaceType, layer_map_for_output},
     input::{
-        keyboard::FilterResult,
+        keyboard::{FilterResult, Keysym, keysyms as xkb},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, SERIAL_COUNTER},
     wayland::shell::wlr_layer::Layer as WlrLayer,
 };
+use tracing::{error, info};
 
 use crate::backend::Backend;
 use crate::state::State;
@@ -100,20 +103,59 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         None
     }
 
+    fn run_program(&self, cmd: String) {
+        info!(cmd, "Starting program");
+
+        if let Err(e) = Command::new(&cmd)
+            .envs(
+                self.socket_name
+                    .to_str()
+                    .clone()
+                    .map(|v| ("WAYLAND_DISPLAY", v))
+                    .into_iter(),
+            )
+            .spawn()
+        {
+            error!(cmd, err = %e, "Failed to start program");
+        }
+    }
+
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event, .. } => {
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = Event::time_msec(&event);
-
+                let mut vt_to_switch = None;
+                let mut cmd_to_run = None;
                 self.seat.get_keyboard().unwrap().input::<(), _>(
                     self,
                     event.key_code(),
                     event.state(),
                     serial,
                     time,
-                    |_, _, _| FilterResult::Forward,
+                    |_, modifiers, handle| {
+                        let keysym = handle.modified_sym();
+                        if (xkb::KEY_XF86Switch_VT_1..=xkb::KEY_XF86Switch_VT_12)
+                            .contains(&keysym.raw())
+                        {
+                            // VTSwitch
+                            let vt = (keysym.raw() - xkb::KEY_XF86Switch_VT_1 + 1) as i32;
+                            vt_to_switch = Some(vt);
+                            FilterResult::Intercept(())
+                        } else if modifiers.logo && keysym == Keysym::Return {
+                            cmd_to_run = Some("weston-terminal");
+                            FilterResult::Intercept(())
+                        } else {
+                            FilterResult::Forward
+                        }
+                    },
                 );
+                if let Some(vt) = vt_to_switch {
+                    self.backend_data.change_vt(vt);
+                } else if let Some(cmd) = cmd_to_run {
+                    self.run_program(cmd.into());
+                }
+                println!("Keyboard key: {:?}", event.key_code());
             }
             InputEvent::PointerMotion { .. } => {}
             InputEvent::PointerMotionAbsolute { event, .. } => {

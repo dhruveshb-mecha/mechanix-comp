@@ -25,4 +25,6 @@ pub trait Backend {
     fn early_import(&mut self, surface: &WlSurface) {
         let _ = surface;
     }
+
+    fn change_vt(&mut self, _vt: i32) {} // no-op by default
 }
