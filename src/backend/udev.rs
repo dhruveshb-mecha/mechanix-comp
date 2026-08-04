@@ -11,6 +11,8 @@ use smithay::backend::drm::{
     DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmNode, NodeType,
 };
 use smithay::backend::egl::{EGLContext, EGLDisplay};
+use smithay::backend::input::InputEvent;
+use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
@@ -21,6 +23,7 @@ use smithay::output::{Mode as WlMode, Output, PhysicalProperties};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
 use smithay::reexports::drm::control::{ModeTypeFlags, connector, crtc};
+use smithay::reexports::input::{DeviceCapability, Libinput};
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::reexports::wayland_server::backend::GlobalId;
@@ -38,12 +41,8 @@ const SUPPORTED_FORMATS: &[Fourcc] = &[Fourcc::Argb8888, Fourcc::Xrgb8888];
 
 /// Concrete `DrmOutput` type: GBM allocator + framebuffer exporter, no per-frame
 /// user data (`()`), backed by a `DrmDeviceFd`.
-type GbmDrmOutput = DrmOutput<
-    GbmAllocator<DrmDeviceFd>,
-    GbmFramebufferExporter<DrmDeviceFd>,
-    (),
-    DrmDeviceFd,
->;
+type GbmDrmOutput =
+    DrmOutput<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>;
 type GbmDrmOutputManager = DrmOutputManager<
     GbmAllocator<DrmDeviceFd>,
     GbmFramebufferExporter<DrmDeviceFd>,
@@ -81,6 +80,7 @@ pub struct UdevData {
     /// device is added.
     renderer: Option<GlesRenderer>,
     devices: HashMap<DrmNode, DeviceData>,
+    keyboards: Vec<smithay::reexports::input::Device>,
 }
 
 impl Backend for UdevData {
@@ -114,17 +114,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Pick the primary GPU and normalize to its primary (card) node, which is
     // the one that carries KMS/modesetting.
-    let primary_path = if let Ok(custom_dev) = std::env::var("MECHA_DRM_DEVICE").or_else(|_| std::env::var("WLR_DRM_DEVICES")) {
+    let primary_path = if let Ok(custom_dev) =
+        std::env::var("MECHA_DRM_DEVICE").or_else(|_| std::env::var("WLR_DRM_DEVICES"))
+    {
         let p = std::path::PathBuf::from(&custom_dev);
         if p.exists() {
             p
         } else {
             let candidate = std::path::PathBuf::from(format!("/dev/dri/{custom_dev}"));
-            if candidate.exists() {
-                candidate
-            } else {
-                p
-            }
+            if candidate.exists() { candidate } else { p }
         }
     } else {
         primary_gpu(&session.seat())?.ok_or("no GPU found for seat")?
@@ -143,12 +141,48 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         primary_gpu,
         renderer: None,
         devices: HashMap::new(),
+        keyboards: Vec::new(),
     };
 
     let mut state = State::new(&mut event_loop, display, udev_data);
 
-    // Enumerate DRM devices; add the primary one (single-GPU: others ignored).
     let udev_backend = UdevBackend::new(state.seat.name())?;
+    // Initialize libinput backend
+    let mut libinput_context = Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(
+        state.backend_data.session.clone().into(),
+    );
+    libinput_context
+        .udev_assign_seat(state.seat.name())
+        .unwrap();
+    let libinput_backend = LibinputInputBackend::new(libinput_context.clone());
+
+    // Bind all our objects that get driven by the event loop
+    event_loop
+        .handle()
+        .insert_source(libinput_backend, move |mut event, _, data| {
+            let dh = data.display_handle.clone();
+            if let InputEvent::DeviceAdded { device } = &mut event {
+                if device.has_capability(DeviceCapability::Keyboard) {
+                    if let Some(led_state) = data
+                        .seat
+                        .get_keyboard()
+                        .map(|keyboard| keyboard.led_state())
+                    {
+                        device.led_update(led_state.into());
+                    }
+                    data.backend_data.keyboards.push(device.clone());
+                }
+            } else if let InputEvent::DeviceRemoved { ref device } = event {
+                if device.has_capability(DeviceCapability::Keyboard) {
+                    data.backend_data.keyboards.retain(|item| item != device);
+                }
+            }
+
+            data.process_input_event(event)
+        })
+        .unwrap();
+
+    // Enumerate DRM devices; add the primary one (single-GPU: others ignored).
     let primary_dev_id = primary_gpu.dev_id();
     if let Some((_, path)) = udev_backend
         .device_list()
@@ -249,7 +283,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 impl State<UdevData> {
-    fn device_added(&mut self, node: DrmNode, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    fn device_added(
+        &mut self,
+        node: DrmNode,
+        path: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // Single-GPU: we only ever render on and scan out from the primary GPU.
         if node != self.backend_data.primary_gpu {
             info!("Ignoring non-primary GPU {node}");
@@ -518,10 +556,12 @@ impl State<UdevData> {
                 &self.lock_surfaces,
             );
 
-            match surface
-                .drm_output
-                .render_frame(renderer, &elements, clear_color, FrameFlags::DEFAULT)
-            {
+            match surface.drm_output.render_frame(
+                renderer,
+                &elements,
+                clear_color,
+                FrameFlags::DEFAULT,
+            ) {
                 Ok(result) if !result.is_empty => match surface.drm_output.queue_frame(()) {
                     Ok(()) => true,
                     Err(err) => {
@@ -608,14 +648,14 @@ impl State<UdevData> {
             }
 
             let has_live_surface = self.lock_surfaces.iter().any(|s| s.alive());
-            if has_live_surface
-                && let Some(locker) = self.pending_lock.take()
-            {
+            if has_live_surface && let Some(locker) = self.pending_lock.take() {
                 locker.lock();
             }
         } else {
             for window in self.space.elements() {
-                window.send_frame(output, now, Some(Duration::ZERO), |_, _| Some(output.clone()));
+                window.send_frame(output, now, Some(Duration::ZERO), |_, _| {
+                    Some(output.clone())
+                });
             }
             for layer_surface in layer_map_for_output(output).layers() {
                 layer_surface.send_frame(output, now, Some(Duration::ZERO), |_, _| {
