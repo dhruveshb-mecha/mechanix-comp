@@ -284,7 +284,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         state.socket_name
     );
 
-    event_loop.run(None, &mut state, |_| {})?;
+    event_loop.run(None, &mut state, |state| {
+        state.space.refresh();
+        state.popups.cleanup();
+        let _ = state.display_handle.flush_clients();
+    })?;
 
     Ok(())
 }
@@ -634,8 +638,6 @@ impl State<UdevData> {
                 state.render_surface(node, crtc);
             });
         }
-
-        let _ = self.display_handle.flush_clients();
     }
 
     /// Notify clients that their content was displayed so they render the next
@@ -670,9 +672,6 @@ impl State<UdevData> {
                 });
             }
         }
-
-        self.space.refresh();
-        self.popups.cleanup();
     }
 }
 
