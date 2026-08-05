@@ -35,6 +35,12 @@ impl Backend for WinitData {
         // The winit backend re-renders a full frame every time; there are no
         // scanout buffers to reset.
     }
+
+    fn touch_transform(&self, _output: &Output) -> Transform {
+        // Nested winit windows report positions in window space already, so
+        // absolute input needs no output-transform correction.
+        Transform::Normal
+    }
 }
 
 /// Create the nested winit window, wire up the compositor state, and run the

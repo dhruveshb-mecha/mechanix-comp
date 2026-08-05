@@ -1,6 +1,7 @@
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::Transform;
 
 pub mod udev;
 pub mod winit;
@@ -27,4 +28,11 @@ pub trait Backend {
     }
 
     fn change_vt(&mut self, _vt: i32) {} // no-op by default
+
+    /// Transform to apply to absolute (touch) input positions for `output`.
+    /// Nested winit windows already report positions in window space, so they
+    /// want identity; udev/DRM (and trait default) reports them in the output's transformed space.
+    fn touch_transform(&self, output: &Output) -> Transform {
+        output.current_transform()
+    }
 }

@@ -207,7 +207,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let output = output?;
         let output_geometry = self.space.output_geometry(output)?;
 
-        let transform = output.current_transform();
+        let transform = self.backend_data.touch_transform(output);
         let size = transform.invert().transform_size(output_geometry.size);
         Some(
             transform.transform_point_in(evt.position_transformed(size), &size.to_f64())
