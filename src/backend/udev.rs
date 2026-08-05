@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use smithay::backend::allocator::Fourcc;
@@ -284,11 +285,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         state.socket_name
     );
 
-    event_loop.run(None, &mut state, |state| {
-        state.space.refresh();
-        state.popups.cleanup();
-        let _ = state.display_handle.flush_clients();
-    })?;
+    while state.running.load(Ordering::SeqCst) {
+        let result = event_loop.dispatch(Some(Duration::from_millis(16)), &mut state);
+        if result.is_err() {
+            state.running.store(false, Ordering::SeqCst);
+        } else {
+            state.space.refresh();
+            state.popups.cleanup();
+            state.display_handle.flush_clients().unwrap();
+        }
+    }
 
     Ok(())
 }

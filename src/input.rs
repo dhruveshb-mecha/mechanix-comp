@@ -1,20 +1,20 @@
-use std::process::Command;
+use std::{process::Command, sync::atomic::Ordering};
 
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
     },
     desktop::{WindowSurfaceType, layer_map_for_output},
     input::{
-        keyboard::{FilterResult, Keysym, keysyms as xkb},
+        keyboard::{FilterResult, Keysym, ModifiersState, keysyms, xkb},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, SERIAL_COUNTER},
     wayland::shell::wlr_layer::Layer as WlrLayer,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::backend::Backend;
 use crate::state::State;
@@ -103,60 +103,106 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         None
     }
 
-    fn run_program(&self, cmd: String) {
-        info!(cmd, "Starting program");
+    fn process_common_key_action(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::None => (),
 
-        if let Err(e) = Command::new(&cmd)
-            .envs(
-                self.socket_name
-                    .to_str()
-                    .clone()
-                    .map(|v| ("WAYLAND_DISPLAY", v))
-                    .into_iter(),
-            )
-            .spawn()
-        {
-            error!(cmd, err = %e, "Failed to start program");
+            KeyAction::VtSwitch(vt) => {
+                self.backend_data.change_vt(vt);
+            }
+
+            KeyAction::Quit => {
+                info!("Quitting.");
+                self.running.store(false, Ordering::SeqCst);
+            }
+
+            KeyAction::Run(cmd) => {
+                info!(cmd, "Starting program");
+
+                if let Err(e) = Command::new(&cmd)
+                    .envs(
+                        self.socket_name
+                            .to_str()
+                            .clone()
+                            .map(|v| ("WAYLAND_DISPLAY", v)),
+                    )
+                    .spawn()
+                {
+                    error!(cmd, err = %e, "Failed to start program");
+                }
+            }
         }
+    }
+
+    fn keyboard_key_to_action<B: InputBackend>(&mut self, evt: B::KeyboardKeyEvent) -> KeyAction {
+        let keycode = evt.key_code();
+        let state = evt.state();
+        debug!(?keycode, ?state, "key");
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = Event::time_msec(&evt);
+        let mut suppressed_keys = self.suppressed_keys.clone();
+        let keyboard = self.seat.get_keyboard().unwrap();
+
+        let action = keyboard
+            .input(
+                self,
+                keycode,
+                state,
+                serial,
+                time,
+                |_, modifiers, handle| {
+                    let keysym = handle.modified_sym();
+
+                    debug!(
+                        ?state,
+                        mods = ?modifiers,
+                        keysym = xkb::keysym_get_name(keysym),
+                        "keysym"
+                    );
+
+                    // If the key is pressed and triggered a action
+                    // we will not forward the key to the client.
+                    // Additionally add the key to the suppressed keys
+                    // so that we can decide on a release if the key
+                    // should be forwarded to the client or not.
+                    if let KeyState::Pressed = state {
+                        let action = process_keyboard_shortcut(*modifiers, keysym);
+
+                        if action.is_some() {
+                            suppressed_keys.push(keysym);
+                        }
+
+                        action
+                            .map(FilterResult::Intercept)
+                            .unwrap_or(FilterResult::Forward)
+                    } else {
+                        let suppressed = suppressed_keys.contains(&keysym);
+                        if suppressed {
+                            suppressed_keys.retain(|k| *k != keysym);
+                            FilterResult::Intercept(KeyAction::None)
+                        } else {
+                            FilterResult::Forward
+                        }
+                    }
+                },
+            )
+            .unwrap_or(KeyAction::None);
+
+        self.suppressed_keys = suppressed_keys;
+        action
     }
 
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
-            InputEvent::Keyboard { event, .. } => {
-                let serial = SERIAL_COUNTER.next_serial();
-                let time = Event::time_msec(&event);
-                let mut vt_to_switch = None;
-                let mut cmd_to_run = None;
-                self.seat.get_keyboard().unwrap().input::<(), _>(
-                    self,
-                    event.key_code(),
-                    event.state(),
-                    serial,
-                    time,
-                    |_, modifiers, handle| {
-                        let keysym = handle.modified_sym();
-                        if (xkb::KEY_XF86Switch_VT_1..=xkb::KEY_XF86Switch_VT_12)
-                            .contains(&keysym.raw())
-                        {
-                            // VTSwitch
-                            let vt = (keysym.raw() - xkb::KEY_XF86Switch_VT_1 + 1) as i32;
-                            vt_to_switch = Some(vt);
-                            FilterResult::Intercept(())
-                        } else if modifiers.logo && keysym == Keysym::Return {
-                            cmd_to_run = Some("weston-terminal");
-                            FilterResult::Intercept(())
-                        } else {
-                            FilterResult::Forward
-                        }
-                    },
-                );
-                if let Some(vt) = vt_to_switch {
-                    self.backend_data.change_vt(vt);
-                } else if let Some(cmd) = cmd_to_run {
-                    self.run_program(cmd.into());
-                }
-                println!("Keyboard key: {:?}", event.key_code());
-            }
+            InputEvent::Keyboard { event, .. } => match self.keyboard_key_to_action::<I>(event) {
+                // TODO Separate for different backends e.g. VtSwitch
+                action => match action {
+                    KeyAction::VtSwitch(_)
+                    | KeyAction::None
+                    | KeyAction::Quit
+                    | KeyAction::Run(_) => self.process_common_key_action(action),
+                },
+            },
             InputEvent::PointerMotion { .. } => {}
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let output = self.space.outputs().next().unwrap();
@@ -307,5 +353,39 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             }
             _ => {}
         }
+    }
+}
+
+/// Possible results of a keyboard action
+#[derive(Debug)]
+enum KeyAction {
+    /// Quit the compositor
+    Quit,
+    /// Trigger a vt-switch
+    VtSwitch(i32),
+    /// run a command
+    Run(String),
+    /// Do nothing more
+    None,
+}
+
+fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Option<KeyAction> {
+    if modifiers.ctrl && modifiers.alt && keysym == Keysym::BackSpace
+        || modifiers.logo && keysym == Keysym::q
+    {
+        // ctrl+alt+backspace = quit
+        // logo + q = quit
+        Some(KeyAction::Quit)
+    } else if (keysyms::KEY_XF86Switch_VT_1..=keysyms::KEY_XF86Switch_VT_12).contains(&keysym.raw())
+    {
+        // VTSwitch
+        Some(KeyAction::VtSwitch(
+            (keysym.raw() - keysyms::KEY_XF86Switch_VT_1 + 1) as i32,
+        ))
+    } else if modifiers.logo && keysym == Keysym::Return {
+        // run terminal
+        Some(KeyAction::Run("weston-terminal".into()))
+    } else {
+        None
     }
 }

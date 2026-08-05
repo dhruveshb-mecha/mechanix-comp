@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use smithay::backend::renderer::ImportDma;
@@ -166,9 +167,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     // Only send the `locked` event once at least one live lock
                     // surface has been registered.
                     let has_live_surface = state.lock_surfaces.iter().any(|s| s.alive());
-                    if has_live_surface
-                        && let Some(locker) = state.pending_lock.take()
-                    {
+                    if has_live_surface && let Some(locker) = state.pending_lock.take() {
                         locker.lock();
                     }
                 }
@@ -190,7 +189,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         state.socket_name
     );
 
-    event_loop.run(None, &mut state, move |_| {})?;
+    while state.running.load(Ordering::SeqCst) {
+        let result = event_loop.dispatch(Some(Duration::from_millis(1)), &mut state);
+        if result.is_err() {
+            state.running.store(false, Ordering::SeqCst);
+        } else {
+            state.space.refresh();
+            state.popups.cleanup();
+            state.display_handle.flush_clients().unwrap();
+        }
+    }
 
     Ok(())
 }
