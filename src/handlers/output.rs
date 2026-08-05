@@ -1,4 +1,5 @@
+use crate::backend::Backend;
 use crate::state::State;
 use smithay::wayland::output::OutputHandler;
 
-impl OutputHandler for State {}
+impl<BackendData: Backend + 'static> OutputHandler for State<BackendData> {}

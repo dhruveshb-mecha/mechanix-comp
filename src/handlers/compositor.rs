@@ -1,3 +1,4 @@
+use crate::backend::Backend;
 use crate::handlers::{layer_shell, xdg_shell};
 use crate::state::State;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
@@ -7,7 +8,7 @@ use smithay::wayland::compositor::{
     CompositorHandler, CompositorState, get_parent, is_sync_subsurface,
 };
 
-impl CompositorHandler for State {
+impl<BackendData: Backend + 'static> CompositorHandler for State<BackendData> {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
     }
@@ -24,6 +25,7 @@ impl CompositorHandler for State {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        self.backend_data.early_import(surface);
 
         let mut child_to_center: Option<smithay::desktop::Window> = None;
 

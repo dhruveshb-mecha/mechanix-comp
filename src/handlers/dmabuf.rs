@@ -1,9 +1,10 @@
+use crate::backend::Backend;
 use crate::state::State;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::ImportDma;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 
-impl DmabufHandler for State {
+impl<BackendData: Backend + 'static> DmabufHandler for State<BackendData> {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
         &mut self.dmabuf_state
     }
@@ -16,10 +17,10 @@ impl DmabufHandler for State {
     ) {
         // Import eagerly to validate the buffer at attach time. The resulting
         // texture is discarded here — `GlesRenderer` weak-ref-caches dmabuf
-        // imports, so `render_output` reuses it when sampling the surface.
-        match self.backend.renderer().import_dmabuf(&dmabuf, None) {
+        // imports, so the render pass reuses it when sampling the surface.
+        match self.backend_data.renderer().import_dmabuf(&dmabuf, None) {
             Ok(_texture) => {
-                let _ = notifier.successful::<State>();
+                let _ = notifier.successful::<State<BackendData>>();
             }
             Err(_) => notifier.failed(),
         }

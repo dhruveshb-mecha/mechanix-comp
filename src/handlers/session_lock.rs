@@ -1,3 +1,4 @@
+use crate::backend::Backend;
 use crate::state::State;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -6,7 +7,7 @@ use smithay::wayland::session_lock::{
     LockSurface, LockSurfaceConfigure, SessionLockHandler, SessionLockManagerState, SessionLocker,
 };
 
-impl SessionLockHandler for State {
+impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
     fn lock_state(&mut self) -> &mut SessionLockManagerState {
         &mut self.session_lock_state
     }

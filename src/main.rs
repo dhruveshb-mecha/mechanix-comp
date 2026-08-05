@@ -1,32 +1,31 @@
+mod backend;
 mod handlers;
 mod input;
+mod render;
 mod state;
-mod winit;
-
-use crate::state::State;
-use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::reexports::calloop::EventLoop;
-use smithay::reexports::wayland_server::Display;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
-    let display: Display<State> = Display::new()?;
+    // Backend selection: an explicit `MECHA_BACKEND` wins; otherwise we assume
+    // we're nested (winit) when a parent display server is present, and drive
+    // KMS/DRM directly (udev) when running from a bare VT.
+    let use_winit = match std::env::var("MECHA_BACKEND").ok().as_deref() {
+        Some("winit") => true,
+        Some("udev") => false,
+        Some(other) => {
+            eprintln!("unknown MECHA_BACKEND={other:?}, falling back to auto-detection");
+            nested_session_present()
+        }
+        None => nested_session_present(),
+    };
 
-    // Create the winit backend first so its GLES renderer is available when the
-    // dmabuf global is built inside `State::new`.
-    let (backend, winit) = smithay::backend::winit::init::<GlesRenderer>()?;
+    if use_winit {
+        backend::winit::run()
+    } else {
+        backend::udev::run()
+    }
+}
 
-    let mut state = State::new(&mut event_loop, display, backend);
-
-    // Open a Wayland/X11 window for our nested compositor
-    crate::winit::init_winit(&mut event_loop, &mut state, winit)?;
-
-    println!(
-        "Compositor listening on Wayland socket: {:?}",
-        state.socket_name
-    );
-
-    event_loop.run(None, &mut state, move |_| {})?;
-
-    Ok(())
+/// True when we appear to be running inside another Wayland or X11 session.
+fn nested_session_present() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some()
 }

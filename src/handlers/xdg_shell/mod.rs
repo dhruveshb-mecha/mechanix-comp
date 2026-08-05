@@ -1,5 +1,6 @@
 pub mod decoration;
 
+use crate::backend::Backend;
 use crate::state::State;
 use smithay::desktop::{
     PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window, WindowSurfaceType,
@@ -15,25 +16,25 @@ use smithay::wayland::shell::xdg::{
     XdgToplevelSurfaceData,
 };
 
-impl XdgShellHandler for State {
+impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        let window = Window::new_wayland_window(surface);
+        let window = Window::new_wayland_window(surface.clone());
 
         let loc = if let Some(output) = self.space.outputs().next().cloned() {
             let zone = layer_map_for_output(&output).non_exclusive_zone();
-            if window.toplevel().unwrap().parent().is_some() {
+            if surface.parent().is_some() {
                 // Dialog with a parent — constrain to the zone but don't fill
                 // it. The dialog will be centered once it commits its buffer.
-                window.toplevel().unwrap().with_pending_state(|state| {
+                surface.with_pending_state(|state| {
                     state.bounds = Some(zone.size);
                 });
                 (0, 0).into()
             } else {
-                window.toplevel().unwrap().with_pending_state(|state| {
+                surface.with_pending_state(|state| {
                     state.size = Some(zone.size);
                 });
                 zone.loc
@@ -41,6 +42,8 @@ impl XdgShellHandler for State {
         } else {
             (0, 0).into()
         };
+
+        surface.send_configure();
 
         self.space.map_element(window.clone(), loc, true);
         self.focus_window(&window);
@@ -185,7 +188,7 @@ impl XdgShellHandler for State {
     }
 }
 
-impl State {
+impl<BackendData: Backend + 'static> State<BackendData> {
     pub fn focus_window(&mut self, window: &Window) {
         self.space.raise_element(window, true);
 
@@ -349,7 +352,10 @@ impl State {
     }
 }
 
-pub fn handle_commit(state: &mut State, surface: &WlSurface) {
+pub fn handle_commit<BackendData: Backend + 'static>(
+    state: &mut State<BackendData>,
+    surface: &WlSurface,
+) {
     if let Some(window) = state
         .space
         .elements()

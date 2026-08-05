@@ -9,4 +9,6 @@ pub mod shm;
 pub mod xdg_activation;
 pub mod xdg_shell;
 
-smithay::delegate_dispatch2!(crate::state::State);
+use crate::backend::Backend;
+
+smithay::delegate_dispatch2!(@<BackendData: Backend + 'static> crate::state::State<BackendData>);

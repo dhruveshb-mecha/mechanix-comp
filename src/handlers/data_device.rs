@@ -1,4 +1,5 @@
-use crate::State;
+use crate::backend::Backend;
+use crate::state::State;
 use smithay::input::Seat;
 use smithay::input::dnd::{DnDGrab, DndGrabHandler, GrabType, Source};
 use smithay::input::pointer::Focus;
@@ -9,12 +10,12 @@ use smithay::wayland::selection::data_device::{
     DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
 };
 
-impl SelectionHandler for State {
+impl<BackendData: Backend + 'static> SelectionHandler for State<BackendData> {
     type SelectionUserData = ();
 }
 
-impl DndGrabHandler for State {}
-impl WaylandDndGrabHandler for State {
+impl<BackendData: Backend + 'static> DndGrabHandler for State<BackendData> {}
+impl<BackendData: Backend + 'static> WaylandDndGrabHandler for State<BackendData> {
     fn dnd_requested<S: Source>(
         &mut self,
         source: S,
@@ -40,7 +41,7 @@ impl WaylandDndGrabHandler for State {
     }
 }
 
-impl DataDeviceHandler for State {
+impl<BackendData: Backend + 'static> DataDeviceHandler for State<BackendData> {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
         &mut self.data_device_state
     }

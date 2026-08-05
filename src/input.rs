@@ -1,21 +1,27 @@
+use std::{process::Command, sync::atomic::Ordering};
+
 use smithay::{
     backend::input::{
-        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
+        InputBackend, InputEvent, KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        TouchEvent,
     },
     desktop::{WindowSurfaceType, layer_map_for_output},
     input::{
-        keyboard::FilterResult,
+        keyboard::{FilterResult, Keysym, ModifiersState, keysyms, xkb},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
+        touch::{DownEvent, UpEvent},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, SERIAL_COUNTER},
     wayland::shell::wlr_layer::Layer as WlrLayer,
 };
+use tracing::{debug, error, info};
 
+use crate::backend::Backend;
 use crate::state::State;
 
-impl State {
+impl<BackendData: Backend + 'static> State<BackendData> {
     /// Find the surface (and its location) under `pos`, in z-order:
     /// Overlay/Top layer surfaces first, then `Space` toplevels, then
     /// Bottom/Background layer surfaces. Layer surfaces live in the output's
@@ -99,21 +105,209 @@ impl State {
         None
     }
 
+    fn process_common_key_action(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::None => (),
+
+            KeyAction::VtSwitch(vt) => {
+                self.backend_data.change_vt(vt);
+            }
+
+            KeyAction::Quit => {
+                info!("Quitting.");
+                self.running.store(false, Ordering::SeqCst);
+            }
+
+            KeyAction::Run(cmd) => {
+                info!(cmd, "Starting program");
+
+                if let Err(e) = Command::new(&cmd)
+                    .envs(
+                        self.socket_name
+                            .to_str()
+                            .clone()
+                            .map(|v| ("WAYLAND_DISPLAY", v)),
+                    )
+                    .spawn()
+                {
+                    error!(cmd, err = %e, "Failed to start program");
+                }
+            }
+        }
+    }
+
+    fn keyboard_key_to_action<B: InputBackend>(&mut self, evt: B::KeyboardKeyEvent) -> KeyAction {
+        let keycode = evt.key_code();
+        let state = evt.state();
+        debug!(?keycode, ?state, "key");
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = Event::time_msec(&evt);
+        let mut suppressed_keys = self.suppressed_keys.clone();
+        let keyboard = self.seat.get_keyboard().unwrap();
+
+        let action = keyboard
+            .input(
+                self,
+                keycode,
+                state,
+                serial,
+                time,
+                |_, modifiers, handle| {
+                    let keysym = handle.modified_sym();
+
+                    debug!(
+                        ?state,
+                        mods = ?modifiers,
+                        keysym = xkb::keysym_get_name(keysym),
+                        "keysym"
+                    );
+
+                    // If the key is pressed and triggered a action
+                    // we will not forward the key to the client.
+                    // Additionally add the key to the suppressed keys
+                    // so that we can decide on a release if the key
+                    // should be forwarded to the client or not.
+                    if let KeyState::Pressed = state {
+                        let action = process_keyboard_shortcut(*modifiers, keysym);
+
+                        if action.is_some() {
+                            suppressed_keys.push(keysym);
+                        }
+
+                        action
+                            .map(FilterResult::Intercept)
+                            .unwrap_or(FilterResult::Forward)
+                    } else {
+                        let suppressed = suppressed_keys.contains(&keysym);
+                        if suppressed {
+                            suppressed_keys.retain(|k| *k != keysym);
+                            FilterResult::Intercept(KeyAction::None)
+                        } else {
+                            FilterResult::Forward
+                        }
+                    }
+                },
+            )
+            .unwrap_or(KeyAction::None);
+
+        self.suppressed_keys = suppressed_keys;
+        action
+    }
+
+    fn touch_location_transformed<B: InputBackend, E: AbsolutePositionEvent<B>>(
+        &self,
+        evt: &E,
+    ) -> Option<Point<f64, Logical>> {
+        let output = self
+            .space
+            .outputs()
+            .find(|output| output.name().starts_with("eDP"))
+            .or_else(|| self.space.outputs().next());
+
+        let output = output?;
+        let output_geometry = self.space.output_geometry(output)?;
+
+        let transform = self.backend_data.touch_transform(output);
+        let size = transform.invert().transform_size(output_geometry.size);
+        Some(
+            transform.transform_point_in(evt.position_transformed(size), &size.to_f64())
+                + output_geometry.loc.to_f64(),
+        )
+    }
+
+    fn on_touch_down<B: InputBackend>(&mut self, evt: B::TouchDownEvent) {
+        let Some(handle) = self.seat.get_touch() else {
+            return;
+        };
+
+        let Some(touch_location) = self.touch_location_transformed(&evt) else {
+            return;
+        };
+
+        let serial = SERIAL_COUNTER.next_serial();
+        // self.update_keyboard_focus(touch_location, serial);
+
+        let under = self.surface_under(touch_location);
+        handle.down(
+            self,
+            under,
+            &DownEvent {
+                slot: evt.slot(),
+                location: touch_location,
+                serial,
+                time: evt.time_msec(),
+            },
+        );
+    }
+
+    fn on_touch_up<B: InputBackend>(&mut self, evt: B::TouchUpEvent) {
+        let Some(handle) = self.seat.get_touch() else {
+            return;
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        handle.up(
+            self,
+            &UpEvent {
+                slot: evt.slot(),
+                serial,
+                time: evt.time_msec(),
+            },
+        )
+    }
+
+    fn on_touch_motion<B: InputBackend>(&mut self, evt: B::TouchMotionEvent) {
+        let Some(handle) = self.seat.get_touch() else {
+            return;
+        };
+        let Some(touch_location) = self.touch_location_transformed(&evt) else {
+            return;
+        };
+
+        let under = self.surface_under(touch_location);
+        handle.motion(
+            self,
+            under,
+            &smithay::input::touch::MotionEvent {
+                slot: evt.slot(),
+                location: touch_location,
+                time: evt.time_msec(),
+            },
+        );
+    }
+
+    fn on_touch_frame<B: InputBackend>(&mut self, _evt: B::TouchFrameEvent) {
+        let Some(handle) = self.seat.get_touch() else {
+            return;
+        };
+        handle.frame(self);
+    }
+
+    fn on_touch_cancel<B: InputBackend>(&mut self, _evt: B::TouchCancelEvent) {
+        let Some(handle) = self.seat.get_touch() else {
+            return;
+        };
+        handle.cancel(self);
+    }
+
+    fn on_device_added<B: InputBackend>(&mut self, device: B::Device) {
+        if device.has_capability(DeviceCapability::Touch) && self.seat.get_touch().is_none() {
+            self.seat.add_touch();
+        }
+    }
+
+    fn on_device_removed<B: InputBackend>(&mut self, _device: B::Device) {}
+
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
-            InputEvent::Keyboard { event, .. } => {
-                let serial = SERIAL_COUNTER.next_serial();
-                let time = Event::time_msec(&event);
-
-                self.seat.get_keyboard().unwrap().input::<(), _>(
-                    self,
-                    event.key_code(),
-                    event.state(),
-                    serial,
-                    time,
-                    |_, _, _| FilterResult::Forward,
-                );
-            }
+            InputEvent::Keyboard { event, .. } => match self.keyboard_key_to_action::<I>(event) {
+                // TODO Separate for different backends e.g. VtSwitch
+                action => match action {
+                    KeyAction::VtSwitch(_)
+                    | KeyAction::None
+                    | KeyAction::Quit
+                    | KeyAction::Run(_) => self.process_common_key_action(action),
+                },
+            },
             InputEvent::PointerMotion { .. } => {}
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let output = self.space.outputs().next().unwrap();
@@ -262,7 +456,48 @@ impl State {
                 pointer.axis(self, frame);
                 pointer.frame(self);
             }
+            InputEvent::TouchDown { event } => self.on_touch_down::<I>(event),
+            InputEvent::TouchUp { event } => self.on_touch_up::<I>(event),
+            InputEvent::TouchMotion { event } => self.on_touch_motion::<I>(event),
+            InputEvent::TouchFrame { event } => self.on_touch_frame::<I>(event),
+            InputEvent::TouchCancel { event } => self.on_touch_cancel::<I>(event),
+            InputEvent::DeviceAdded { device } => self.on_device_added::<I>(device),
+            InputEvent::DeviceRemoved { device } => self.on_device_removed::<I>(device),
             _ => {}
         }
+    }
+}
+
+/// Possible results of a keyboard action
+#[derive(Debug)]
+enum KeyAction {
+    /// Quit the compositor
+    Quit,
+    /// Trigger a vt-switch
+    VtSwitch(i32),
+    /// run a command
+    Run(String),
+    /// Do nothing more
+    None,
+}
+
+fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Option<KeyAction> {
+    if modifiers.ctrl && modifiers.alt && keysym == Keysym::BackSpace
+        || modifiers.logo && keysym == Keysym::q
+    {
+        // ctrl+alt+backspace = quit
+        // logo + q = quit
+        Some(KeyAction::Quit)
+    } else if (keysyms::KEY_XF86Switch_VT_1..=keysyms::KEY_XF86Switch_VT_12).contains(&keysym.raw())
+    {
+        // VTSwitch
+        Some(KeyAction::VtSwitch(
+            (keysym.raw() - keysyms::KEY_XF86Switch_VT_1 + 1) as i32,
+        ))
+    } else if modifiers.logo && keysym == Keysym::Return {
+        // run terminal
+        Some(KeyAction::Run("weston-terminal".into()))
+    } else {
+        None
     }
 }
