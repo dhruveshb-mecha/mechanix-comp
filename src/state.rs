@@ -1,8 +1,10 @@
 use std::ffi::OsString;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use smithay::desktop::{PopupManager, Space, Window};
+use smithay::input::keyboard::Keysym;
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::{
     EventLoop, Interest, LoopSignal, Mode, PostAction, generic::Generic,
@@ -26,6 +28,7 @@ use crate::backend::Backend;
 
 pub struct State<BackendData: Backend + 'static> {
     pub start_time: Instant,
+    pub running: Arc<AtomicBool>,
     pub socket_name: OsString,
     pub display_handle: DisplayHandle,
 
@@ -45,6 +48,7 @@ pub struct State<BackendData: Backend + 'static> {
     pub popups: PopupManager,
 
     pub seat: Seat<Self>,
+    pub suppressed_keys: Vec<Keysym>,
 
     // Rendering backend + dmabuf import. The dmabuf global is created lazily by
     // each backend once its renderer (and thus its format list) exists.
@@ -104,6 +108,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         Self {
             start_time,
+            running: Arc::new(AtomicBool::new(true)),
             socket_name,
             display_handle: dh,
             space,
@@ -119,6 +124,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             seat_state,
             popups,
             seat,
+            suppressed_keys: Vec::new(),
             backend_data,
             dmabuf_state,
             dmabuf_global: None,
@@ -129,10 +135,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    fn init_wayland_listener(
-        display: Display<Self>,
-        event_loop: &mut EventLoop<Self>,
-    ) -> OsString {
+    fn init_wayland_listener(display: Display<Self>, event_loop: &mut EventLoop<Self>) -> OsString {
         let listening_socket = ListeningSocketSource::new_auto().unwrap();
         let socket_name = listening_socket.socket_name().to_os_string();
 
