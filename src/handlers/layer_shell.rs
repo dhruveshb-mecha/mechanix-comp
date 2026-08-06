@@ -4,11 +4,10 @@ use smithay::desktop::{LayerSurface, PopupKind, WindowSurfaceType, layer_map_for
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::wlr_layer::{
-    Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData, WlrLayerShellHandler,
-    WlrLayerShellState,
+    KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData,
+    WlrLayerShellHandler, WlrLayerShellState,
 };
 use smithay::wayland::shell::xdg::PopupSurface;
 
@@ -24,11 +23,9 @@ impl<BackendData: Backend + 'static> WlrLayerShellHandler for State<BackendData>
         _layer: Layer,
         namespace: String,
     ) {
-        // Layer surfaces belong to an output's `LayerMap`, not the `Space`.
-        // Honour the client's requested output, falling back to the single
-        // winit output. Keyboard focus and the initial configure are deferred
-        // to the commit path (`handle_commit`), where the double-buffered
-        // interactivity state has actually been applied.
+        // Map into the output's `LayerMap`; keyboard focus and the initial
+        // configure are deferred to `handle_commit`, once the double-buffered
+        // interactivity state is applied.
         let output = wl_output
             .as_ref()
             .and_then(Output::from_resource)
@@ -41,7 +38,7 @@ impl<BackendData: Backend + 'static> WlrLayerShellHandler for State<BackendData>
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
-        // Just unmap; keyboard focus and toplevel geometry are left as-is.
+        // Just unmap; toplevel geometry is left as-is.
         if let Some((mut map, layer)) = self.space.outputs().find_map(|o| {
             let map = layer_map_for_output(o);
             let layer = map
@@ -52,32 +49,21 @@ impl<BackendData: Backend + 'static> WlrLayerShellHandler for State<BackendData>
         }) {
             map.unmap_layer(&layer);
         }
+        if self.layer_shell_on_demand_focus.as_ref() == Some(surface.wl_surface()) {
+            self.layer_shell_on_demand_focus = None;
+        }
     }
 
     fn new_popup(&mut self, _parent: WlrLayerSurface, popup: PopupSurface) {
-        eprintln!("[layer_shell] new_popup called: {:?}", popup.wl_surface());
         self.unconstrain_layer_popup(&popup);
         let _ = self.popups.track_popup(PopupKind::Xdg(popup));
-        eprintln!("[layer_shell] popup tracked");
     }
 }
 
-impl<BackendData: Backend + 'static> State<BackendData> {
-    /// Give keyboard focus to a layer surface. Layer surfaces are their own
-    /// keyboard-focus target (`KeyboardFocus = WlSurface`), so this is a plain
-    /// `set_focus` on the surface.
-    fn focus_layer_surface(&mut self, surface: WlSurface) {
-        let keyboard = self.seat.get_keyboard().unwrap();
-        let serial = SERIAL_COUNTER.next_serial();
-        keyboard.set_focus(self, Some(surface), serial);
-    }
-}
-
-/// Should be called on `WlSurface::commit`. Handles the layer-surface side of a
-/// commit: arranges the map, sends the initial configure the first time, and —
-/// once the surface is configured and its interactivity is known — grabs
-/// keyboard focus if the surface requested it. Returns `true` if `surface` was
-/// a layer surface (so the caller can skip the toplevel path).
+/// Layer-surface side of a commit: arrange the map, send the initial configure,
+/// and mark newly-mapped `OnDemand` layers (Overlay/Top) so
+/// `update_keyboard_focus` gives them keyboard focus. Returns `true` if
+/// `surface` was a layer surface (so the caller can skip the toplevel path).
 pub fn handle_commit<BackendData: Backend + 'static>(
     state: &mut State<BackendData>,
     surface: &WlSurface,
@@ -105,21 +91,20 @@ pub fn handle_commit<BackendData: Backend + 'static>(
             .initial_configure_sent
     });
 
-    // Arrange the layers (recomputing exclusive zones) before configuring, so
-    // the client is told the size it will actually get. `arrange` reports
-    // whether the layout actually changed, so per-frame content commits that
-    // leave the zone untouched don't trigger a needless toplevel reflow.
-    let (layout_changed, needs_configure, wants_focus) = {
+    // Arrange before configuring so the client gets its real size. Only reflow
+    // toplevels when the layout actually moved.
+    let (layout_changed, needs_configure, on_demand) = {
         let mut map = layer_map_for_output(&output);
         let layout_changed = map.arrange();
         let layer = map
             .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
             .unwrap();
-        (
-            layout_changed,
-            !initial_configure_sent,
-            layer.can_receive_keyboard_focus(),
-        )
+        // Newly-mapped `OnDemand` layers take keyboard focus, but only on
+        // Overlay/Top; Bottom/Background are click-to-focus.
+        let cached = layer.cached_state();
+        let on_demand = matches!(cached.layer, Layer::Overlay | Layer::Top)
+            && cached.keyboard_interactivity == KeyboardInteractivity::OnDemand;
+        (layout_changed, !initial_configure_sent, on_demand)
     };
 
     if needs_configure {
@@ -130,17 +115,14 @@ pub fn handle_commit<BackendData: Backend + 'static>(
         layer.layer_surface().send_configure();
     }
 
-    // Reflow the toplevels into the new non-exclusive zone only when the layer
-    // arrangement actually moved (a panel mapped, resized, or changed its
-    // exclusive zone).
+    // Reflow the toplevels when the layout changed.
     if layout_changed {
         state.reflow_toplevels();
     }
 
-    // Grab keyboard focus for launchers/panels that asked for it (Exclusive or
-    // OnDemand). Only meaningful once the surface has been configured.
-    if !initial_configure_sent && wants_focus {
-        state.focus_layer_surface(surface.clone());
+    // Panels/launchers take keyboard focus on open; applied next frame.
+    if needs_configure && on_demand {
+        state.layer_shell_on_demand_focus = Some(surface.clone());
     }
 
     true

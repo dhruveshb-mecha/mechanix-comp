@@ -1,6 +1,3 @@
-use std::sync::atomic::Ordering;
-use std::time::Duration;
-
 use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -15,9 +12,8 @@ use crate::backend::Backend;
 use crate::render::output_elements;
 use crate::state::State;
 
-/// Backend data for the nested winit window. Both the output and the damage
-/// tracker are captured by the redraw closure rather than stored here, so this
-/// only owns the graphics backend itself.
+/// Backend data for the nested winit window. The output and damage tracker are
+/// captured by the redraw closure, so this only owns the graphics backend.
 pub struct WinitData {
     pub backend: WinitGraphicsBackend<GlesRenderer>,
 }
@@ -102,9 +98,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     None,
                 );
 
-                // Re-arrange layer surfaces for the new output size, then keep
-                // every open toplevel filling the (possibly changed)
-                // non-exclusive zone.
+                // Re-arrange layers for the new size, keeping toplevels filling
+                // the (possibly changed) non-exclusive zone.
                 layer_map_for_output(&output).arrange();
                 state.reflow_toplevels();
 
@@ -131,6 +126,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &output,
                         state.is_locked,
                         &state.lock_surfaces,
+                        &state.toplevels,
                     );
                     damage_tracker
                         .render_output(renderer, &mut framebuffer, 0, &elements, clear_color)
@@ -138,49 +134,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 state.backend_data.backend.submit(Some(&[damage])).unwrap();
 
-                if !state.is_locked {
-                    state.space.elements().for_each(|window| {
-                        window.send_frame(
-                            &output,
-                            state.start_time.elapsed(),
-                            Some(Duration::ZERO),
-                            |_, _| Some(output.clone()),
-                        )
-                    });
-
-                    for layer_surface in layer_map_for_output(&output).layers() {
-                        layer_surface.send_frame(
-                            &output,
-                            state.start_time.elapsed(),
-                            Some(Duration::ZERO),
-                            |_, _| Some(output.clone()),
-                        );
-                    }
-                }
-
-                if state.is_locked {
-                    // Send frame callbacks only to live surfaces.
-                    for lock_surface in state.lock_surfaces.iter().filter(|s| s.alive()) {
-                        smithay::desktop::utils::send_frames_surface_tree(
-                            lock_surface.wl_surface(),
-                            &output,
-                            state.start_time.elapsed(),
-                            Some(Duration::ZERO),
-                            |_, _| Some(output.clone()),
-                        );
-                    }
-
-                    // Only send the `locked` event once at least one live lock
-                    // surface has been registered.
-                    let has_live_surface = state.lock_surfaces.iter().any(|s| s.alive());
-                    if has_live_surface && let Some(locker) = state.pending_lock.take() {
-                        locker.lock();
-                    }
-                }
-
-                state.space.refresh();
-                state.popups.cleanup();
-                let _ = state.display_handle.flush_clients();
+                state.send_frame_callbacks(&output);
 
                 state.backend_data.backend.window().request_redraw();
             }
@@ -195,16 +149,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         state.socket_name
     );
 
-    while state.running.load(Ordering::SeqCst) {
-        let result = event_loop.dispatch(Some(Duration::from_millis(1)), &mut state);
-        if result.is_err() {
-            state.running.store(false, Ordering::SeqCst);
-        } else {
-            state.space.refresh();
-            state.popups.cleanup();
-            state.display_handle.flush_clients().unwrap();
-        }
-    }
+    event_loop.run(None, &mut state, move |state| {
+        // Per-frame upkeep: refresh the space, clean up dead popups/toplevels,
+        // re-derive keyboard focus, and flush client events.
+        state.space.refresh();
+        state.popups.cleanup();
+        state.cleanup_toplevels();
+        state.update_keyboard_focus();
+        state.foreign_toplevel_refresh();
+        let _ = state.display_handle.flush_clients();
+    })?;
 
     Ok(())
 }

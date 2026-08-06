@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use smithay::backend::allocator::Fourcc;
@@ -19,7 +18,6 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{UdevBackend, UdevEvent, primary_gpu};
-use smithay::desktop::layer_map_for_output;
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
@@ -168,7 +166,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     event_loop
         .handle()
         .insert_source(libinput_backend, move |mut event, _, data| {
-            let dh = data.display_handle.clone();
             if let InputEvent::DeviceAdded { device } = &mut event {
                 if device.has_capability(DeviceCapability::Keyboard) {
                     if let Some(led_state) = data
@@ -285,16 +282,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         state.socket_name
     );
 
-    while state.running.load(Ordering::SeqCst) {
-        let result = event_loop.dispatch(Some(Duration::from_millis(16)), &mut state);
-        if result.is_err() {
-            state.running.store(false, Ordering::SeqCst);
-        } else {
-            state.space.refresh();
-            state.popups.cleanup();
-            state.display_handle.flush_clients().unwrap();
-        }
-    }
+    event_loop.run(None, &mut state, move |state| {
+        // Per-frame upkeep: refresh the space, clean up dead popups/toplevels,
+        // re-derive keyboard focus, and flush client events.
+        state.space.refresh();
+        state.popups.cleanup();
+        state.cleanup_toplevels();
+        state.update_keyboard_focus();
+        state.foreign_toplevel_refresh();
+        let _ = state.display_handle.flush_clients();
+    })?;
 
     Ok(())
 }
@@ -571,6 +568,7 @@ impl State<UdevData> {
                 &output,
                 self.is_locked,
                 &self.lock_surfaces,
+                &self.toplevels,
             );
 
             match surface.drm_output.render_frame(
@@ -643,40 +641,6 @@ impl State<UdevData> {
             self.backend_data.loop_handle.insert_idle(move |state| {
                 state.render_surface(node, crtc);
             });
-        }
-    }
-
-    /// Notify clients that their content was displayed so they render the next
-    /// frame. Mirrors the winit backend's post-present logic.
-    fn send_frame_callbacks(&mut self, output: &Output) {
-        let now = self.start_time.elapsed();
-
-        if self.is_locked {
-            for lock_surface in self.lock_surfaces.iter().filter(|s| s.alive()) {
-                smithay::desktop::utils::send_frames_surface_tree(
-                    lock_surface.wl_surface(),
-                    output,
-                    now,
-                    Some(Duration::ZERO),
-                    |_, _| Some(output.clone()),
-                );
-            }
-
-            let has_live_surface = self.lock_surfaces.iter().any(|s| s.alive());
-            if has_live_surface && let Some(locker) = self.pending_lock.take() {
-                locker.lock();
-            }
-        } else {
-            for window in self.space.elements() {
-                window.send_frame(output, now, Some(Duration::ZERO), |_, _| {
-                    Some(output.clone())
-                });
-            }
-            for layer_surface in layer_map_for_output(output).layers() {
-                layer_surface.send_frame(output, now, Some(Duration::ZERO), |_, _| {
-                    Some(output.clone())
-                });
-            }
         }
     }
 }
