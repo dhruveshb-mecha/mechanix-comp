@@ -18,7 +18,7 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{UdevBackend, UdevEvent, primary_gpu};
-use smithay::output::{Mode as WlMode, Output, PhysicalProperties};
+use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
 use smithay::reexports::drm::control::{ModeTypeFlags, connector, crtc};
@@ -480,7 +480,19 @@ impl State<UdevData> {
         );
         let global = output.create_global::<State<UdevData>>(&self.display_handle);
         output.set_preferred(wl_mode);
-        output.change_current_state(Some(wl_mode), None, None, Some((0, 0).into()));
+        // Auto-detect the scale from the panel's physical size unless overridden.
+        let scale = crate::backend::env_scale().unwrap_or_else(|| {
+            crate::backend::snap_scale(crate::backend::guess_default_scale(
+                connector.size(),
+                wl_mode.size,
+            ))
+        });
+        output.change_current_state(
+            Some(wl_mode),
+            None,
+            Some(Scale::Fractional(scale)),
+            Some((0, 0).into()),
+        );
         output.user_data().insert_if_missing(|| UdevOutputId {
             device_id: node,
             crtc,

@@ -3,7 +3,7 @@ use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{WinitEvent, WinitGraphicsBackend};
 use smithay::desktop::layer_map_for_output;
-use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{Rectangle, Transform};
@@ -72,10 +72,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     let _global = output.create_global::<State<WinitData>>(&state.display_handle);
+    // Follow the host's scale factor unless `MECHA_SCALE` overrides it.
+    let scale = crate::backend::env_scale()
+        .unwrap_or_else(|| crate::backend::snap_scale(state.backend_data.backend.scale_factor()));
     output.change_current_state(
         Some(mode),
         Some(Transform::Flipped180),
-        None,
+        Some(Scale::Fractional(scale)),
         Some((0, 0).into()),
     );
     output.set_preferred(mode);
@@ -87,14 +90,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     event_loop
         .handle()
         .insert_source(winit, move |event, _, state| match event {
-            WinitEvent::Resized { size, .. } => {
+            WinitEvent::Resized { size, scale_factor } => {
+                // Follow the host's scale factor (unless overridden) when it changes.
+                let scale = (crate::backend::env_scale().is_none()
+                    && scale_factor != output.current_scale().fractional_scale())
+                .then(|| Scale::Fractional(crate::backend::snap_scale(scale_factor)));
                 output.change_current_state(
                     Some(Mode {
                         size,
                         refresh: 60_000,
                     }),
                     None,
-                    None,
+                    scale,
                     None,
                 );
 
@@ -104,10 +111,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 state.reflow_toplevels();
 
                 if state.is_locked {
-                    let logical_size = (size.w as u32, size.h as u32).into();
+                    let logical_size = state.space.output_geometry(&output).map(|geo| geo.size);
                     for surface in &state.lock_surfaces {
                         surface.with_pending_state(|pending| {
-                            pending.size = Some(logical_size);
+                            pending.size =
+                                logical_size.map(|size| (size.w as u32, size.h as u32).into());
                         });
                         surface.send_configure();
                     }

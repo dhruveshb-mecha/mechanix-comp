@@ -65,7 +65,7 @@ pub fn output_elements(
                     renderer,
                     lock_surface.wl_surface(),
                     (0, 0),
-                    1.0,
+                    output.current_scale().fractional_scale(),
                     1.0,
                     Kind::Unspecified,
                 )
