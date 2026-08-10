@@ -17,6 +17,7 @@ use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState, with_states};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
+use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
 use smithay::wayland::fractional_scale::{FractionalScaleManagerState, with_fractional_scale};
 use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
 use smithay::wayland::idle_notify::IdleNotifierState;
@@ -116,6 +117,7 @@ pub struct State<BackendData: Backend + 'static> {
     pub lock_surfaces: Vec<LockSurface>,
     pub viewporter_state: ViewporterState,
     pub foreign_toplevel: ForeignToplevelManagerState,
+    pub foreign_toplevel_list: ForeignToplevelListState,
     pub xdg_toplevel_icon: XdgToplevelIconManager,
     pub xdg_dialog_state: XdgDialogState,
     pub idle_notifier_state: IdleNotifierState<State<BackendData>>,
@@ -177,6 +179,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let session_lock_state = SessionLockManagerState::new::<Self, _>(&dh, |_| true);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let foreign_toplevel = ForeignToplevelManagerState::new::<Self>(&dh);
+        let foreign_toplevel_list = ForeignToplevelListState::new::<Self>(&dh);
         let mut xdg_toplevel_icon = XdgToplevelIconManager::new::<Self>(&dh);
         xdg_toplevel_icon.add_icon_size(64);
         let xdg_dialog_state = XdgDialogState::new::<Self>(&dh);
@@ -215,6 +218,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             lock_surfaces: Vec::new(),
             viewporter_state,
             foreign_toplevel,
+            foreign_toplevel_list,
             xdg_toplevel_icon,
             xdg_dialog_state,
             idle_notifier_state,
