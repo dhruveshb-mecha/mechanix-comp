@@ -40,12 +40,12 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
             .or_else(|| self.space.outputs().next().cloned());
 
         let size = output
-            .and_then(|o| o.current_mode())
-            .map(|mode| mode.size)
+            .and_then(|o| self.space.output_geometry(&o))
+            .map(|geo| (geo.size.w as u32, geo.size.h as u32).into())
             .unwrap_or_else(|| (1920, 1080).into());
 
         surface.with_pending_state(|state| {
-            state.size = Some((size.w as u32, size.h as u32).into());
+            state.size = Some(size);
         });
 
         // Give keyboard focus to the first lock surface created.
