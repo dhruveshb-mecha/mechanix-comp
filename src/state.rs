@@ -70,6 +70,8 @@ pub struct WindowState {
     pub window: Window,
     pub kind: WindowKind,
     pub mode: WindowMode,
+    /// True once first-commit handling ran; transients are marked too, though they never join the `Space`.
+    pub mapped: bool,
     /// The xdg-dialog modal hint, cached so input handling needn't lock
     /// surface data on every click.
     pub modal: bool,
