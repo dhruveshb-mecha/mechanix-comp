@@ -31,6 +31,7 @@ use smithay::wayland::shell::xdg::dialog::XdgDialogState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::viewporter::ViewporterState;
+use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
 use smithay::wayland::xdg_activation::XdgActivationState;
 use smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager;
 
@@ -184,6 +185,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let idle_inhibit_manager_state = IdleInhibitManagerState::new::<Self>(&dh);
         let data_control_state = DataControlState::new::<Self, _>(&dh, None, |_| true);
         let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
+        VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
