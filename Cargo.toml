@@ -29,5 +29,6 @@ rev = "492497f064d786aafec3c01e03b24a2cd0d31426"
 default-features = false
 
 [dependencies]
+thiserror = "2.0.20"
 tracing = "0.1"
 xcursor = "0.3.11"
