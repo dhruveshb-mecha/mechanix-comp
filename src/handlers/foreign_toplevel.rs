@@ -1,20 +1,10 @@
-//! Unified `ext-foreign-toplevel-list-v1` + `zwlr-foreign-toplevel-management-v1`
-//! implementation.
-//!
-//! Both protocols are served from a single map of toplevels keyed by
-//! `wl_surface`, so identifiers and state stay consistent across them. The map
-//! is (re)built by [`State::foreign_toplevel_refresh`], called from the
-//! backends' idle callbacks, which diffs the current windows against the
-//! announced ones and emits the appropriate events.
+//! Our zwlr-foreign-toplevel-management-v1 + smithay's ext-foreign-toplevel-list-v1, driven by [`State::foreign_toplevel_refresh`].
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use smithay::output::Output;
-use smithay::reexports::wayland_protocols::ext::foreign_toplevel_list::v1::server::{
-    ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
-    ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
-};
+use smithay::reexports::wayland_protocols::ext::foreign_toplevel_list::v1::server::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::server::{
     zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
     zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
@@ -27,69 +17,37 @@ use smithay::reexports::wayland_server::{
 };
 use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::compositor::with_states;
+use smithay::wayland::foreign_toplevel_list::{
+    ForeignToplevelHandle, ForeignToplevelListHandler, ForeignToplevelListState,
+};
 use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 use smithay::wayland::{Dispatch2, GlobalDispatch2};
 
 use crate::backend::Backend;
 use crate::state::{State, WindowKind, WindowMode};
 
-const EXT_LIST_VERSION: u32 = 1;
 const WLR_MANAGEMENT_VERSION: u32 = 3;
 
-/// Global user data for both manager globals. Currently carries no state; it
-/// exists so the globals get a distinct `GlobalDispatch2` impl.
-#[derive(Default)]
-pub struct ForeignToplevelGlobalData;
-
-/// Resource user data for the manager and handle resources. The per-client
-/// announcement state lives in [`ForeignToplevelManagerState`], so this is a
-/// marker type only.
+/// Marker so the wlr global and resources dispatch here.
 #[derive(Default)]
 pub struct ForeignToplevelUdata;
 
 /// What the foreign-toplevel protocols need to know about one toplevel.
 #[derive(Debug)]
 pub struct ToplevelData {
-    /// Monotonic, never-reused identifier (ext-list sends it as a string).
-    identifier: u64,
     title: String,
     app_id: String,
     /// The wlr `state` event payload: maximized/fullscreen/activated flags.
     states: Vec<u8>,
     /// The output the toplevel is currently on, for `output_enter`/`leave`.
     output: Option<Output>,
-    /// Per-client ext-list handles announcing this toplevel.
-    ext_list_instances: HashSet<ExtForeignToplevelHandleV1>,
     /// Per-client wlr handles, each with the outputs entered so far.
     wlr_management_instances: HashMap<ZwlrForeignToplevelHandleV1, Vec<WlOutput>>,
+    /// smithay's ext-list handle; owns all ext instance bookkeeping.
+    ext_handle: Option<ForeignToplevelHandle>,
 }
 
 impl ToplevelData {
-    fn add_ext_instance<D>(
-        &mut self,
-        handle: &DisplayHandle,
-        client: &Client,
-        manager: &ExtForeignToplevelListV1,
-    ) where
-        D: Dispatch<ExtForeignToplevelHandleV1, ForeignToplevelUdata> + 'static,
-    {
-        let Ok(toplevel) = client.create_resource::<ExtForeignToplevelHandleV1, _, D>(
-            handle,
-            manager.version(),
-            ForeignToplevelUdata,
-        ) else {
-            return;
-        };
-        manager.toplevel(&toplevel);
-
-        toplevel.identifier(self.identifier.to_string());
-        toplevel.title(self.title.clone());
-        toplevel.app_id(self.app_id.clone());
-        toplevel.done();
-
-        self.ext_list_instances.insert(toplevel);
-    }
-
     fn add_wlr_instance<D>(
         &mut self,
         handle: &DisplayHandle,
@@ -125,8 +83,7 @@ impl ToplevelData {
     }
 }
 
-/// One toplevel as seen at refresh time, decoupled from the live state so the
-/// refresh can diff against the already-announced data.
+/// A toplevel snapshot at refresh time, for diffing against announced data.
 struct ToplevelSnapshot {
     surface: WlSurface,
     title: String,
@@ -138,40 +95,35 @@ struct ToplevelSnapshot {
 /// The foreign-toplevel module state, held by [`State`].
 #[derive(Default)]
 pub struct ForeignToplevelManagerState {
-    ext_list_instances: HashSet<ExtForeignToplevelListV1>,
     wlr_management_instances: HashSet<ZwlrForeignToplevelManagerV1>,
     toplevels: HashMap<WlSurface, ToplevelData>,
-    next_identifier: u64,
 }
 
 impl ForeignToplevelManagerState {
-    /// Register both globals.
+    /// Register the wlr management global; ext-list lives in `State::foreign_toplevel_list`.
     pub fn new<D>(dh: &DisplayHandle) -> Self
     where
-        D: GlobalDispatch<ExtForeignToplevelListV1, ForeignToplevelGlobalData>,
-        D: GlobalDispatch<ZwlrForeignToplevelManagerV1, ForeignToplevelGlobalData>,
-        D: Dispatch<ExtForeignToplevelListV1, ForeignToplevelUdata>,
-        D: Dispatch<ExtForeignToplevelHandleV1, ForeignToplevelUdata>,
+        D: GlobalDispatch<ZwlrForeignToplevelManagerV1, ForeignToplevelUdata>,
         D: Dispatch<ZwlrForeignToplevelManagerV1, ForeignToplevelUdata>,
         D: Dispatch<ZwlrForeignToplevelHandleV1, ForeignToplevelUdata>,
         D: 'static,
     {
-        dh.create_global::<D, ExtForeignToplevelListV1, _>(
-            EXT_LIST_VERSION,
-            ForeignToplevelGlobalData,
-        );
         dh.create_global::<D, ZwlrForeignToplevelManagerV1, _>(
             WLR_MANAGEMENT_VERSION,
-            ForeignToplevelGlobalData,
+            ForeignToplevelUdata,
         );
         Self::default()
     }
 
-    /// Diff `snapshots` against the announced toplevels and emit the protocol
-    /// events for removed, new and changed toplevels.
-    fn apply<D>(&mut self, dh: &DisplayHandle, snapshots: Vec<ToplevelSnapshot>)
-    where
-        D: Dispatch<ExtForeignToplevelHandleV1, ForeignToplevelUdata>
+    /// Diff snapshots against announced toplevels, emitting events; also drives ext-list in the same pass.
+    fn apply<D>(
+        &mut self,
+        dh: &DisplayHandle,
+        list: &mut ForeignToplevelListState,
+        snapshots: Vec<ToplevelSnapshot>,
+    ) where
+        D: ForeignToplevelListHandler
+            + Dispatch<ExtForeignToplevelHandleV1, ForeignToplevelHandle>
             + Dispatch<ZwlrForeignToplevelHandleV1, ForeignToplevelUdata>
             + 'static,
     {
@@ -179,8 +131,8 @@ impl ForeignToplevelManagerState {
         self.toplevels.retain(|surface, data| {
             let keep = snapshots.iter().any(|snap| snap.surface == *surface);
             if !keep {
-                for instance in data.ext_list_instances.iter() {
-                    instance.closed();
+                if let Some(handle) = data.ext_handle.take() {
+                    list.remove_toplevel(&handle);
                 }
                 for instance in data.wlr_management_instances.keys() {
                     instance.closed();
@@ -207,6 +159,19 @@ impl ForeignToplevelManagerState {
                         new_app_id = Some(snap.app_id.clone());
                     }
 
+                    // ext handle stays in sync with the diff above, so only touch it on changes.
+                    if (new_title.is_some() || new_app_id.is_some())
+                        && let Some(handle) = &data.ext_handle
+                    {
+                        if let Some(title) = &new_title {
+                            handle.send_title(title);
+                        }
+                        if let Some(app_id) = &new_app_id {
+                            handle.send_app_id(app_id);
+                        }
+                        handle.send_done();
+                    }
+
                     let mut states_changed = false;
                     if data.states != snap.states {
                         data.states = snap.states.clone();
@@ -217,18 +182,6 @@ impl ForeignToplevelManagerState {
                     if data.output.as_ref() != snap.output.as_ref() {
                         data.output = snap.output.clone();
                         output_changed = true;
-                    }
-
-                    if new_title.is_some() || new_app_id.is_some() {
-                        for instance in &data.ext_list_instances {
-                            if let Some(title) = &new_title {
-                                instance.title(title.clone());
-                            }
-                            if let Some(app_id) = &new_app_id {
-                                instance.app_id(app_id.clone());
-                            }
-                            instance.done();
-                        }
                     }
 
                     if new_title.is_some()
@@ -270,21 +223,15 @@ impl ForeignToplevelManagerState {
                 }
                 Entry::Vacant(entry) => {
                     let mut data = ToplevelData {
-                        identifier: self.next_identifier,
                         title: snap.title,
                         app_id: snap.app_id,
                         states: snap.states,
                         output: snap.output,
-                        ext_list_instances: HashSet::new(),
                         wlr_management_instances: HashMap::new(),
+                        ext_handle: None,
                     };
-                    self.next_identifier += 1;
-
-                    for manager in &self.ext_list_instances {
-                        if let Some(client) = manager.client() {
-                            data.add_ext_instance::<D>(dh, &client, manager);
-                        }
-                    }
+                    data.ext_handle =
+                        Some(list.new_toplevel::<D>(data.title.clone(), data.app_id.clone()));
                     for manager in &self.wlr_management_instances {
                         if let Some(client) = manager.client() {
                             data.add_wlr_instance::<D>(dh, &client, manager);
@@ -304,12 +251,6 @@ impl ForeignToplevelManagerState {
             .map(|(surface, _)| surface.clone())
     }
 
-    fn remove_ext_instance(&mut self, resource: &ExtForeignToplevelHandleV1) {
-        for data in self.toplevels.values_mut() {
-            data.ext_list_instances.remove(resource);
-        }
-    }
-
     fn remove_wlr_instance(&mut self, resource: &ZwlrForeignToplevelHandleV1) {
         for data in self.toplevels.values_mut() {
             data.wlr_management_instances.remove(resource);
@@ -317,8 +258,7 @@ impl ForeignToplevelManagerState {
     }
 }
 
-/// The wlr `state` event payload for a toplevel in `mode` with `focused`
-/// keyboard focus.
+/// The wlr `state` payload for a toplevel in `mode` with `focused` focus.
 fn to_state_vec(mode: WindowMode, focused: bool) -> Vec<u8> {
     let mut states = Vec::new();
     if matches!(mode, WindowMode::Maximized) {
@@ -348,9 +288,7 @@ fn foreign_toplevel_title_app_id(surface: &WlSurface) -> (String, String) {
 }
 
 impl<BackendData: Backend + 'static> State<BackendData> {
-    /// Reconcile the foreign-toplevel protocols with the current windows.
-    /// Called from the backends' idle callbacks. The focused toplevel is
-    /// processed last so clients see the old window deactivate first.
+    /// Reconcile both protocols with the current windows; focused last so old windows deactivate first.
     pub fn foreign_toplevel_refresh(&mut self) {
         let focused = self.seat.get_keyboard().unwrap().current_focus();
 
@@ -380,8 +318,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             snapshots.sort_by_key(|snap| (snap.surface == focused) as u8);
         }
 
-        self.foreign_toplevel
-            .apply::<State<BackendData>>(&self.display_handle, snapshots);
+        self.foreign_toplevel.apply::<State<BackendData>>(
+            &self.display_handle,
+            &mut self.foreign_toplevel_list,
+            snapshots,
+        );
     }
 
     /// wlr `activate` request: raise the toplevel and give it keyboard focus.
@@ -404,30 +345,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 }
 
-impl<BackendData: Backend + 'static> GlobalDispatch2<ExtForeignToplevelListV1, State<BackendData>>
-    for ForeignToplevelGlobalData
-{
-    fn bind(
-        &self,
-        state: &mut State<BackendData>,
-        dh: &DisplayHandle,
-        client: &Client,
-        resource: New<ExtForeignToplevelListV1>,
-        data_init: &mut DataInit<'_, State<BackendData>>,
-    ) {
-        let manager = data_init.init(resource, ForeignToplevelUdata);
-
-        for data in state.foreign_toplevel.toplevels.values_mut() {
-            data.add_ext_instance::<State<BackendData>>(dh, client, &manager);
-        }
-
-        state.foreign_toplevel.ext_list_instances.insert(manager);
+impl<BackendData: Backend + 'static> ForeignToplevelListHandler for State<BackendData> {
+    fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
+        &mut self.foreign_toplevel_list
     }
 }
 
 impl<BackendData: Backend + 'static>
-    GlobalDispatch2<ZwlrForeignToplevelManagerV1, State<BackendData>>
-    for ForeignToplevelGlobalData
+    GlobalDispatch2<ZwlrForeignToplevelManagerV1, State<BackendData>> for ForeignToplevelUdata
 {
     fn bind(
         &self,
@@ -447,69 +372,6 @@ impl<BackendData: Backend + 'static>
             .foreign_toplevel
             .wlr_management_instances
             .insert(manager);
-    }
-}
-
-impl<BackendData: Backend + 'static> Dispatch2<ExtForeignToplevelListV1, State<BackendData>>
-    for ForeignToplevelUdata
-{
-    fn request(
-        &self,
-        state: &mut State<BackendData>,
-        _client: &Client,
-        resource: &ExtForeignToplevelListV1,
-        request: ext_foreign_toplevel_list_v1::Request,
-        _dh: &DisplayHandle,
-        _data_init: &mut DataInit<'_, State<BackendData>>,
-    ) {
-        match request {
-            ext_foreign_toplevel_list_v1::Request::Stop => {
-                resource.finished();
-                // Remove the instance so no further events are sent.
-                state.foreign_toplevel.ext_list_instances.remove(resource);
-            }
-            ext_foreign_toplevel_list_v1::Request::Destroy => {}
-            _ => unreachable!(),
-        }
-    }
-
-    fn destroyed(
-        &self,
-        state: &mut State<BackendData>,
-        _client: ClientId,
-        resource: &ExtForeignToplevelListV1,
-    ) {
-        // Also remove the instance here, in case `stop` was never sent
-        // (e.g. sudden disconnect).
-        state.foreign_toplevel.ext_list_instances.remove(resource);
-    }
-}
-
-impl<BackendData: Backend + 'static> Dispatch2<ExtForeignToplevelHandleV1, State<BackendData>>
-    for ForeignToplevelUdata
-{
-    fn request(
-        &self,
-        _state: &mut State<BackendData>,
-        _client: &Client,
-        _resource: &ExtForeignToplevelHandleV1,
-        request: ext_foreign_toplevel_handle_v1::Request,
-        _dh: &DisplayHandle,
-        _data_init: &mut DataInit<'_, State<BackendData>>,
-    ) {
-        match request {
-            ext_foreign_toplevel_handle_v1::Request::Destroy => {}
-            _ => unreachable!(),
-        }
-    }
-
-    fn destroyed(
-        &self,
-        state: &mut State<BackendData>,
-        _client: ClientId,
-        resource: &ExtForeignToplevelHandleV1,
-    ) {
-        state.foreign_toplevel.remove_ext_instance(resource);
     }
 }
 
@@ -575,9 +437,7 @@ impl<BackendData: Backend + 'static> Dispatch2<ZwlrForeignToplevelHandleV1, Stat
             | zwlr_foreign_toplevel_handle_v1::Request::SetRectangle { .. }
             | zwlr_foreign_toplevel_handle_v1::Request::SetFullscreen { .. }
             | zwlr_foreign_toplevel_handle_v1::Request::UnsetFullscreen => {
-                // State changes are driven by the compositor's own policy
-                // (reflected back via the `state` event on the next refresh);
-                // there is no client-requested maximize/minimize here.
+                // State is compositor-driven and reflected back on the next refresh.
             }
             zwlr_foreign_toplevel_handle_v1::Request::Activate { .. } => {
                 state.foreign_activate(&surface);
