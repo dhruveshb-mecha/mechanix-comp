@@ -9,6 +9,7 @@ use smithay::utils::Rectangle;
 use smithay::wayland::input_method::{InputMethodHandler, PopupSurface};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::selection::data_device::set_data_device_focus;
+use smithay::wayland::tablet_manager::TabletSeatHandler;
 use tracing::warn;
 
 impl<BackendData: Backend + 'static> SeatHandler for State<BackendData> {
@@ -55,3 +56,5 @@ impl<BackendData: Backend> InputMethodHandler for State<BackendData> {
             .unwrap_or_default()
     }
 }
+
+impl<BackendData: Backend> TabletSeatHandler for State<BackendData> {}
