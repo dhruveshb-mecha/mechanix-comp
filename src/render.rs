@@ -55,10 +55,11 @@ pub fn output_elements(
     toplevels: &HashMap<WlSurface, WindowState>,
     custom_elements: Vec<Element>,
 ) -> (Vec<Element>, [f32; 4]) {
+    // Queue cursor elements first
+    let mut elements = custom_elements;
     if is_locked {
         // Only render live lock surfaces. Dead surfaces (client crashed) produce
         // no elements and fall back to the solid red clear color.
-        let mut elements = Vec::new();
         for lock_surface in lock_surfaces.iter().filter(|s| s.alive()) {
             elements.extend(
                 render_elements_from_surface_tree::<
@@ -76,11 +77,9 @@ pub fn output_elements(
                 .map(OutputElements::Surface),
             );
         }
-        elements.extend(custom_elements);
         (elements, CLEAR_COLOR_LOCKED)
     } else {
         let scale = output.current_scale().fractional_scale();
-        let mut elements: Vec<Element> = Vec::new();
 
         // Transients (tooltip fallbacks) render above everything, like the
         // xdg_popup tooltips they stand in for.
@@ -265,8 +264,6 @@ pub fn output_elements(
                 .map(OutputElements::Surface),
             );
         }
-
-        elements.extend(custom_elements);
         (elements, CLEAR_COLOR)
     }
 }
