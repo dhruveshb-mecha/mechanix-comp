@@ -1,10 +1,10 @@
 use crate::backend::Backend;
-use crate::state::State;
+use crate::state::{DndIcon, State};
 use smithay::input::Seat;
-use smithay::input::dnd::{DnDGrab, DndGrabHandler, GrabType, Source};
+use smithay::input::dnd::{DnDGrab, DndGrabHandler, DndTarget, GrabType, Source};
 use smithay::input::pointer::Focus;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::Serial;
+use smithay::utils::{Logical, Point, Serial};
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::data_device::{
     DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
@@ -14,16 +14,32 @@ impl<BackendData: Backend + 'static> SelectionHandler for State<BackendData> {
     type SelectionUserData = ();
 }
 
-impl<BackendData: Backend + 'static> DndGrabHandler for State<BackendData> {}
+impl<BackendData: Backend + 'static> DndGrabHandler for State<BackendData> {
+    fn dropped(
+        &mut self,
+        _target: Option<DndTarget<'_, Self>>,
+        _validated: bool,
+        _seat: Seat<Self>,
+        _location: Point<f64, Logical>,
+    ) {
+        self.dnd_icon = None;
+    }
+}
+
 impl<BackendData: Backend + 'static> WaylandDndGrabHandler for State<BackendData> {
     fn dnd_requested<S: Source>(
         &mut self,
         source: S,
-        _icon: Option<WlSurface>,
+        icon: Option<WlSurface>,
         seat: Seat<Self>,
         serial: Serial,
         type_: GrabType,
     ) {
+        self.dnd_icon = icon.map(|surface| DndIcon {
+            surface,
+            offset: (0, 0).into(),
+        });
+
         match type_ {
             GrabType::Pointer => {
                 let ptr = seat.get_pointer().unwrap();

@@ -83,6 +83,14 @@ pub struct WindowState {
     pub modal: bool,
 }
 
+/// The icon surface a client sets for an active drag-and-drop, drawn next to
+/// the cursor while the grab is running.
+#[derive(Debug)]
+pub struct DndIcon {
+    pub surface: WlSurface,
+    pub offset: Point<i32, Logical>,
+}
+
 pub struct State<BackendData: Backend + 'static> {
     pub start_time: Instant,
     pub socket_name: OsString,
@@ -114,6 +122,9 @@ pub struct State<BackendData: Backend + 'static> {
     pub clock: Clock<Monotonic>,
     pub pointer: PointerHandle<State<BackendData>>,
     pub cursor_position_hint: Option<(WlSurface, Point<f64, Logical>)>,
+
+    /// The drag-and-drop icon, set on `dnd_requested` and cleared on drop.
+    pub dnd_icon: Option<DndIcon>,
 
     // Rendering backend + dmabuf import. The dmabuf global is created lazily by
     // each backend once its renderer (and thus its format list) exists.
@@ -227,6 +238,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             cursor_status: CursorImageStatus::default_named(),
             pointer,
             cursor_position_hint: None,
+            dnd_icon: None,
             clock,
             backend_data,
             dmabuf_state,

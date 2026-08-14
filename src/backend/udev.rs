@@ -16,7 +16,11 @@ use smithay::backend::input::InputEvent;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::element::AsRenderElements;
+use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
+use smithay::backend::renderer::element::surface::{
+    WaylandSurfaceRenderElement, render_elements_from_surface_tree,
+};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
@@ -31,14 +35,14 @@ use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::GlobalId;
-use smithay::utils::{DeviceFd, Transform};
+use smithay::utils::{DeviceFd, IsAlive, Transform};
 use smithay::wayland::compositor::with_states;
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use tracing::{error, info, warn};
 
 use crate::backend::Backend;
 use crate::drawing::PointerElement;
-use crate::render::{Element, output_elements};
+use crate::render::{Element, OutputElements, output_elements};
 use crate::state::State;
 
 // Scanout framebuffer formats to try, most preferred first. 8-bit only keeps
@@ -707,6 +711,30 @@ impl State<UdevData> {
                             1.0,
                         ),
                     );
+
+                    // Draw the dnd icon if applicable.
+                    if let Some(icon) = self.dnd_icon.as_ref() {
+                        let dnd_icon_pos = (cursor_pos + icon.offset.to_f64())
+                            .to_physical(scale)
+                            .to_i32_round();
+                        if icon.surface.alive() {
+                            custom_elements.extend(
+                                render_elements_from_surface_tree::<
+                                    GlesRenderer,
+                                    WaylandSurfaceRenderElement<GlesRenderer>,
+                                >(
+                                    renderer,
+                                    &icon.surface,
+                                    dnd_icon_pos,
+                                    scale,
+                                    1.0,
+                                    Kind::Unspecified,
+                                )
+                                .into_iter()
+                                .map(OutputElements::Surface),
+                            );
+                        }
+                    }
                 }
 
                 output_elements(
