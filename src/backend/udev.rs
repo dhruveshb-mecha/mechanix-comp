@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use smithay::backend::allocator::Fourcc;
@@ -14,10 +15,13 @@ use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::input::InputEvent;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::ImportDma;
+use smithay::backend::renderer::element::AsRenderElements;
+use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{UdevBackend, UdevEvent, primary_gpu};
+use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
@@ -25,12 +29,15 @@ use smithay::reexports::drm::control::{ModeTypeFlags, connector, crtc};
 use smithay::reexports::input::{DeviceCapability, Libinput};
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::GlobalId;
-use smithay::utils::DeviceFd;
+use smithay::utils::{DeviceFd, Transform};
+use smithay::wayland::compositor::with_states;
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use tracing::{error, info, warn};
 
 use crate::backend::Backend;
+use crate::drawing::PointerElement;
 use crate::render::{Element, output_elements};
 use crate::state::State;
 
@@ -80,6 +87,11 @@ pub struct UdevData {
     renderer: Option<GlesRenderer>,
     devices: HashMap<DrmNode, DeviceData>,
     keyboards: Vec<smithay::reexports::input::Device>,
+    /// Loaded xcursor theme used to pick the current cursor frame.
+    pointer_image: crate::cursor::Cursor,
+    /// Cache of imported cursor frames, keyed by the raw xcursor image.
+    pointer_images: Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
+    pointer_element: PointerElement,
 }
 
 impl Backend for UdevData {
@@ -148,6 +160,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         renderer: None,
         devices: HashMap::new(),
         keyboards: Vec::new(),
+        pointer_image: crate::cursor::Cursor::load(),
+        pointer_images: Vec::new(),
+        pointer_element: PointerElement::default(),
     };
 
     let mut state = State::new(&mut event_loop, display, udev_data);
@@ -605,14 +620,99 @@ impl State<UdevData> {
                 return;
             };
 
-            let (elements, clear_color) = output_elements(
-                renderer,
-                &self.space,
-                &output,
-                self.is_locked,
-                &self.lock_surfaces,
-                &self.toplevels,
-            );
+            let (elements, clear_color) = {
+                // Build the pointer cursor element (anvil-style), rendering it
+                // above everything else when the pointer is over this output.
+                let output_geometry = self.space.output_geometry(&output).unwrap();
+                let scale = smithay::utils::Scale::from(output.current_scale().fractional_scale());
+                let pointer_location = self.pointer.current_location();
+
+                let mut custom_elements: Vec<Element> = Vec::new();
+                if output_geometry.to_f64().contains(pointer_location) {
+                    let cursor_hotspot =
+                        if let CursorImageStatus::Surface(surface) = &self.cursor_status {
+                            with_states(surface, |states| {
+                                states
+                                    .data_map
+                                    .get::<Mutex<CursorImageAttributes>>()
+                                    .unwrap()
+                                    .lock()
+                                    .unwrap()
+                                    .hotspot
+                            })
+                        } else {
+                            (0, 0).into()
+                        };
+                    let cursor_pos = pointer_location - output_geometry.loc.to_f64();
+
+                    // Pick the current animation frame, importing it as a
+                    // render buffer once (cached in `pointer_images`).
+                    let frame = self
+                        .backend_data
+                        .pointer_image
+                        .get_image(1 /*scale*/, self.clock.now().into());
+                    let pointer_images = &mut self.backend_data.pointer_images;
+                    let pointer_image = pointer_images
+                        .iter()
+                        .find_map(|(image, texture)| {
+                            if image == &frame {
+                                Some(texture.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            let buffer = MemoryRenderBuffer::from_slice(
+                                &frame.pixels_rgba,
+                                Fourcc::Argb8888,
+                                (frame.width as i32, frame.height as i32),
+                                1,
+                                Transform::Normal,
+                                None,
+                            );
+                            pointer_images.push((frame, buffer.clone()));
+                            buffer
+                        });
+
+                    self.backend_data.pointer_element.set_buffer(pointer_image);
+
+                    // Reset to the default named shape if the
+                    // client-provided cursor surface went away.
+                    {
+                        let mut reset = false;
+                        if let CursorImageStatus::Surface(ref surface) = self.cursor_status {
+                            reset = !surface.is_alive();
+                        }
+                        if reset {
+                            self.cursor_status = CursorImageStatus::default_named();
+                        }
+                        self.backend_data
+                            .pointer_element
+                            .set_status(self.cursor_status.clone());
+                    }
+
+                    custom_elements.extend(
+                        self.backend_data.pointer_element.render_elements(
+                            renderer,
+                            (cursor_pos - cursor_hotspot.to_f64())
+                                .to_physical(scale)
+                                .to_i32_round(),
+                            scale,
+                            1.0,
+                        ),
+                    );
+                }
+
+                output_elements(
+                    renderer,
+                    &self.space,
+                    &output,
+                    self.is_locked,
+                    &self.lock_surfaces,
+                    &self.toplevels,
+                    custom_elements,
+                )
+            };
 
             match surface.drm_output.render_frame(
                 renderer,

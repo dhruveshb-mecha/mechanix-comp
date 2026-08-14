@@ -135,6 +135,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         state.is_locked,
                         &state.lock_surfaces,
                         &state.toplevels,
+                        Vec::new(),
                     );
                     damage_tracker
                         .render_output(renderer, &mut framebuffer, 0, &elements, clear_color)
