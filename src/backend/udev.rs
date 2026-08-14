@@ -647,10 +647,16 @@ impl State<UdevData> {
 
                     // Pick the current animation frame, importing it as a
                     // render buffer once (cached in `pointer_images`).
+                    //
+                    // Load the cursor at the output's scale so the named cursor
+                    // renders at the correct physical size (and sharp) on scaled
+                    // outputs, matching client-provided (surface) cursors.
+                    let cursor_scale =
+                        output.current_scale().fractional_scale().round().max(1.0) as u32;
                     let frame = self
                         .backend_data
                         .pointer_image
-                        .get_image(1 /*scale*/, self.clock.now().into());
+                        .get_image(cursor_scale, self.clock.now().into());
                     let pointer_images = &mut self.backend_data.pointer_images;
                     let pointer_image = pointer_images
                         .iter()
@@ -666,7 +672,7 @@ impl State<UdevData> {
                                 &frame.pixels_rgba,
                                 Fourcc::Argb8888,
                                 (frame.width as i32, frame.height as i32),
-                                1,
+                                cursor_scale as i32,
                                 Transform::Normal,
                                 None,
                             );
