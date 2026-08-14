@@ -1,21 +1,35 @@
+use std::sync::Mutex;
+
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::renderer::element::AsRenderElements;
+use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{WinitEvent, WinitGraphicsBackend};
 use smithay::desktop::layer_map_for_output;
+use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
-use smithay::utils::{Rectangle, Transform};
+use smithay::utils::{IsAlive, Rectangle, Transform};
+use smithay::wayland::compositor::with_states;
 
 use crate::backend::Backend;
-use crate::render::output_elements;
+use crate::drawing::PointerElement;
+use crate::render::{Element, output_elements};
 use crate::state::State;
 
 /// Backend data for the nested winit window. The output and damage tracker are
-/// captured by the redraw closure, so this only owns the graphics backend.
+/// captured by the redraw closure, so this only owns the graphics backend plus
+/// the cursor state (mirroring the udev backend).
 pub struct WinitData {
     pub backend: WinitGraphicsBackend<GlesRenderer>,
+    /// Loaded xcursor theme used to pick the current cursor frame.
+    pub pointer_image: crate::cursor::Cursor,
+    /// Cache of imported cursor frames, keyed by the raw xcursor image.
+    pub pointer_images: Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
+    pub pointer_element: PointerElement,
 }
 
 impl Backend for WinitData {
@@ -46,7 +60,23 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let display: Display<State<WinitData>> = Display::new()?;
 
     let (backend, winit) = smithay::backend::winit::init::<GlesRenderer>()?;
-    let mut state = State::new(&mut event_loop, display, WinitData { backend });
+    let mut state = State::new(
+        &mut event_loop,
+        display,
+        WinitData {
+            backend,
+            pointer_image: crate::cursor::Cursor::load(),
+            pointer_images: Vec::new(),
+            pointer_element: PointerElement::default(),
+        },
+    );
+
+    // Disable the host compositor's cursor.
+    state
+        .backend_data
+        .backend
+        .window()
+        .set_cursor_visible(false);
 
     // Advertise zwp_linux_dmabuf_v1 with the formats the GLES renderer can
     // import, now that the renderer exists.
@@ -126,8 +156,94 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let size = state.backend_data.backend.window_size();
                 let damage = Rectangle::from_size(size);
 
+                // Reset to the default named shape if the client-provided
+                // cursor surface went away, then mirror the status into the
+                // pointer element.
+                {
+                    let mut reset = false;
+                    if let CursorImageStatus::Surface(ref surface) = state.cursor_status {
+                        reset = !surface.alive();
+                    }
+                    if reset {
+                        state.cursor_status = CursorImageStatus::default_named();
+                    }
+                    state
+                        .backend_data
+                        .pointer_element
+                        .set_status(state.cursor_status.clone());
+                }
+
                 {
                     let (renderer, mut framebuffer) = state.backend_data.backend.bind().unwrap();
+                    let scale =
+                        smithay::utils::Scale::from(output.current_scale().fractional_scale());
+
+                    let cursor_pos = state.pointer.current_location();
+                    let cursor_hotspot =
+                        if let CursorImageStatus::Surface(ref surface) = state.cursor_status {
+                            with_states(surface, |states| {
+                                states
+                                    .data_map
+                                    .get::<Mutex<CursorImageAttributes>>()
+                                    .unwrap()
+                                    .lock()
+                                    .unwrap()
+                                    .hotspot
+                            })
+                        } else {
+                            (0, 0).into()
+                        };
+
+                    // Pick the current cursor frame, importing it as a render
+                    // buffer once (cached in `pointer_images`). Load it at the
+                    // output's scale so the named cursor renders at the correct
+                    // physical size on scaled outputs.
+                    let cursor_scale =
+                        output.current_scale().fractional_scale().round().max(1.0) as u32;
+                    let frame = state
+                        .backend_data
+                        .pointer_image
+                        .get_image(cursor_scale, state.clock.now().into());
+                    let pointer_images = &mut state.backend_data.pointer_images;
+                    let pointer_image = pointer_images
+                        .iter()
+                        .find_map(|(image, texture)| {
+                            if image == &frame {
+                                Some(texture.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            let buffer = MemoryRenderBuffer::from_slice(
+                                &frame.pixels_rgba,
+                                Fourcc::Argb8888,
+                                (frame.width as i32, frame.height as i32),
+                                cursor_scale as i32,
+                                Transform::Normal,
+                                None,
+                            );
+                            pointer_images.push((frame, buffer.clone()));
+                            buffer
+                        });
+                    state.backend_data.pointer_element.set_buffer(pointer_image);
+
+                    // Queue the cursor above everything else.
+                    let mut custom_elements: Vec<Element> = Vec::new();
+                    custom_elements.extend(
+                        state
+                            .backend_data
+                            .pointer_element
+                            .render_elements::<Element>(
+                                renderer,
+                                (cursor_pos - cursor_hotspot.to_f64())
+                                    .to_physical(scale)
+                                    .to_i32_round(),
+                                scale,
+                                1.0,
+                            ),
+                    );
+
                     let (elements, clear_color) = output_elements(
                         renderer,
                         &state.space,
@@ -135,7 +251,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         state.is_locked,
                         &state.lock_surfaces,
                         &state.toplevels,
-                        Vec::new(),
+                        custom_elements,
                     );
                     damage_tracker
                         .render_output(renderer, &mut framebuffer, 0, &elements, clear_color)
