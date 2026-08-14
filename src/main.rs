@@ -1,4 +1,6 @@
 mod backend;
+mod cursor;
+mod drawing;
 mod handlers;
 mod input;
 mod render;

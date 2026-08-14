@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use smithay::desktop::{PopupManager, Space, Window, layer_map_for_output};
 use smithay::input::keyboard::Keysym;
+use smithay::input::pointer::{CursorImageStatus, PointerHandle};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
 use smithay::reexports::calloop::{
@@ -14,7 +15,7 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
-use smithay::utils::{Logical, Point, SERIAL_COUNTER};
+use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState, with_states};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
@@ -108,6 +109,10 @@ pub struct State<BackendData: Backend + 'static> {
 
     pub seat: Seat<Self>,
     pub suppressed_keys: Vec<Keysym>,
+    pub cursor_status: CursorImageStatus,
+    pub clock: Clock<Monotonic>,
+    pub pointer: PointerHandle<State<BackendData>>,
+    pub cursor_position_hint: Option<(WlSurface, Point<f64, Logical>)>,
 
     // Rendering backend + dmabuf import. The dmabuf global is created lazily by
     // each backend once its renderer (and thus its format list) exists.
@@ -150,6 +155,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     ) -> Self {
         let start_time = Instant::now();
         let dh = display.handle();
+        let clock = Clock::new();
 
         // The zwp_linux_dmabuf_v1 global is created lazily by each backend once
         // its renderer's format list is available. Dispatch is handled by the
@@ -177,7 +183,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let mut seat_state = SeatState::new();
         let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, seat_name);
         seat.add_keyboard(Default::default(), 200, 25).unwrap();
-        seat.add_pointer();
+        let pointer = seat.add_pointer();
 
         let session_lock_state = SessionLockManagerState::new::<Self, _>(&dh, |_| true);
         let viewporter_state = ViewporterState::new::<Self>(&dh);
@@ -216,6 +222,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             popups,
             seat,
             suppressed_keys: Vec::new(),
+            cursor_status: CursorImageStatus::default_named(),
+            pointer,
+            cursor_position_hint: None,
+            clock,
             backend_data,
             dmabuf_state,
             dmabuf_global: None,
