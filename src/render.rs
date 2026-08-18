@@ -15,6 +15,7 @@ use smithay::wayland::shell::wlr_layer::Layer;
 
 use std::collections::HashMap;
 
+use crate::drawing::PointerRenderElement;
 use crate::state::{WindowKind, WindowMode, WindowState};
 
 // Background shown behind normal desktop contents.
@@ -27,6 +28,7 @@ smithay::backend::renderer::element::render_elements! {
     pub OutputElements<R, E> where R: ImportAll + ImportMem;
     Space = SpaceRenderElements<R, E>,
     Surface = WaylandSurfaceRenderElement<R>,
+    Pointer = PointerRenderElement<R>,
 }
 
 /// Concrete element type used by both backends: the compositor always renders
@@ -51,11 +53,13 @@ pub fn output_elements(
     is_locked: bool,
     lock_surfaces: &[LockSurface],
     toplevels: &HashMap<WlSurface, WindowState>,
+    custom_elements: Vec<Element>,
 ) -> (Vec<Element>, [f32; 4]) {
+    // Queue cursor elements first
+    let mut elements = custom_elements;
     if is_locked {
         // Only render live lock surfaces. Dead surfaces (client crashed) produce
         // no elements and fall back to the solid red clear color.
-        let mut elements = Vec::new();
         for lock_surface in lock_surfaces.iter().filter(|s| s.alive()) {
             elements.extend(
                 render_elements_from_surface_tree::<
@@ -76,7 +80,6 @@ pub fn output_elements(
         (elements, CLEAR_COLOR_LOCKED)
     } else {
         let scale = output.current_scale().fractional_scale();
-        let mut elements: Vec<Element> = Vec::new();
 
         // Transients (tooltip fallbacks) render above everything, like the
         // xdg_popup tooltips they stand in for.
@@ -261,7 +264,6 @@ pub fn output_elements(
                 .map(OutputElements::Surface),
             );
         }
-
         (elements, CLEAR_COLOR)
     }
 }

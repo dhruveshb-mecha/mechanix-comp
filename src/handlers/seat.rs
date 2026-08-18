@@ -1,6 +1,7 @@
 use crate::backend::Backend;
 use crate::state::State;
 use smithay::desktop::{PopupKind, PopupManager};
+use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -8,6 +9,7 @@ use smithay::utils::Rectangle;
 use smithay::wayland::input_method::{InputMethodHandler, PopupSurface};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::selection::data_device::set_data_device_focus;
+use smithay::wayland::tablet_manager::TabletSeatHandler;
 use tracing::warn;
 
 impl<BackendData: Backend + 'static> SeatHandler for State<BackendData> {
@@ -19,11 +21,8 @@ impl<BackendData: Backend + 'static> SeatHandler for State<BackendData> {
         &mut self.seat_state
     }
 
-    fn cursor_image(
-        &mut self,
-        _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
-    ) {
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        self.cursor_status = image;
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
@@ -57,3 +56,5 @@ impl<BackendData: Backend> InputMethodHandler for State<BackendData> {
             .unwrap_or_default()
     }
 }
+
+impl<BackendData: Backend> TabletSeatHandler for State<BackendData> {}
