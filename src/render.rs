@@ -14,6 +14,7 @@ use smithay::wayland::session_lock::LockSurface;
 use smithay::wayland::shell::wlr_layer::Layer;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use crate::drawing::PointerRenderElement;
 use crate::state::{WindowMode, WindowState};
@@ -45,6 +46,7 @@ pub type Element = OutputElements<GlesRenderer, WaylandSurfaceRenderElement<Gles
 /// positions smithay's `space_render_elements` would use) so that popups of
 /// Background/Bottom layers render *above* the windows, while the bars
 /// themselves stay below them.
+#[allow(clippy::too_many_arguments)]
 pub fn output_elements(
     renderer: &mut GlesRenderer,
     space: &Space<Window>,
@@ -52,6 +54,7 @@ pub fn output_elements(
     is_locked: bool,
     lock_surfaces: &[LockSurface],
     toplevels: &HashMap<WlSurface, WindowState>,
+    visible: &HashSet<WlSurface>,
     custom_elements: Vec<Element>,
 ) -> (Vec<Element>, [f32; 4]) {
     // Queue cursor elements first
@@ -185,12 +188,20 @@ pub fn output_elements(
             }
         }
 
-        // The windows.
+        // The windows. Hidden (non-visible) windows are skipped.
         if let Some(output_geo) = space.output_geometry(output) {
+            let in_visible = |window: &Window| {
+                window
+                    .toplevel()
+                    .is_some_and(|t| visible.contains(t.wl_surface()))
+            };
             if space.elements().any(is_fullscreen) {
                 // Fullscreen windows were rendered above; render the rest
                 // individually so they stay below the Top layer.
                 for window in space.elements().rev().filter(|w| !is_fullscreen(w)) {
+                    if !in_visible(window) {
+                        continue;
+                    }
                     let loc = space.element_location(window).unwrap() - output_geo.loc;
                     elements.extend(
                         window
@@ -206,8 +217,8 @@ pub fn output_elements(
                             }),
                     );
                 }
-            } else {
-                // Fast path: no fullscreen windows, render the whole space at
+            } else if visible.len() == space.elements().count() {
+                // Fast path: every window is visible, render the whole space at
                 // once.
                 elements.extend(
                     space
@@ -217,6 +228,28 @@ pub fn output_elements(
                             OutputElements::Space(SpaceRenderElements::Element(Wrap::from(e)))
                         }),
                 );
+            } else {
+                // Only a subset is visible (e.g. the active group): render
+                // those individually so the rest stay hidden.
+                for window in space.elements().rev() {
+                    if !in_visible(window) {
+                        continue;
+                    }
+                    let loc = space.element_location(window).unwrap() - output_geo.loc;
+                    elements.extend(
+                        window
+                            .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+                                renderer,
+                                loc.to_physical_precise_round(scale),
+                                Scale::from(scale),
+                                1.0,
+                            )
+                            .into_iter()
+                            .map(|e| {
+                                OutputElements::Space(SpaceRenderElements::Element(Wrap::from(e)))
+                            }),
+                    );
+                }
             }
         }
 

@@ -48,6 +48,11 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Whether `surface` is stacked on this output.
+    pub fn contains(&self, surface: &WlSurface) -> bool {
+        self.stack.contains(surface)
+    }
+
     pub fn insert(&mut self, surface: WlSurface) {
         if !self.stack.iter().any(|s| s == &surface) {
             self.stack.push(surface);
@@ -79,6 +84,18 @@ impl Layout {
 
     pub fn top(&self) -> Option<&WlSurface> {
         self.stack.last()
+    }
+
+    /// What is on screen when `focused` leads the group: the ancestor chain.
+    pub fn visible(
+        &self,
+        focused: Option<&WlSurface>,
+        parent_of: impl Fn(&WlSurface) -> Option<WlSurface>,
+    ) -> HashSet<WlSurface> {
+        match focused {
+            Some(focused) => ancestor_chain(focused, parent_of).into_iter().collect(),
+            None => HashSet::new(),
+        }
     }
 }
 
@@ -191,7 +208,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             }
         }
     }
+}
 
+impl<BackendData: Backend + 'static> State<BackendData> {
     /// The focused window plus its ancestor chain.
     pub fn active_group(&self) -> HashSet<WlSurface> {
         let Some(focused) = &self.active_window else {
@@ -199,6 +218,18 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         };
         ancestor_chain(focused, |s| self.parent_of(s))
             .into_iter()
+            .collect()
+    }
+
+    /// The active group's surfaces that are stacked on `output`.
+    pub fn visible_surfaces(&self, output: &Output) -> HashSet<WlSurface> {
+        let Some(layout) = self.layouts.get(output) else {
+            return HashSet::new();
+        };
+        layout
+            .visible(self.active_window.as_ref(), |s| self.parent_of(s))
+            .into_iter()
+            .filter(|s| layout.contains(s))
             .collect()
     }
 }

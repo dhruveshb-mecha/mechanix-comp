@@ -95,14 +95,19 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         let modal = self.active_modal_window();
         if let Some((window, location)) = self.space.element_under(pos) {
+            // Hidden windows are outside the active group: skip them so clicks
+            // in the clear area don't reach what isn't shown.
+            let in_group = window
+                .toplevel()
+                .is_some_and(|t| self.active_group().contains(t.wl_surface()));
             // A modal dialog blocks input to every other window.
-            if modal.as_ref().is_none_or(|m| m == window) {
-                if let Some((surface, loc)) = window
+            if in_group
+                && modal.as_ref().is_none_or(|m| m == window)
+                && let Some((surface, loc)) = window
                     .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
                     .map(|(s, p)| (s, (p + location).to_f64()))
-                {
-                    return Some((surface, loc));
-                }
+            {
+                return Some((surface, loc));
             }
         }
 

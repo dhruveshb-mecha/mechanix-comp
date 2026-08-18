@@ -3,6 +3,13 @@ use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use smithay::backend::renderer::element::{
+    RenderElementStates, default_primary_scanout_output_compare,
+};
+use smithay::desktop::utils::{
+    surface_primary_scanout_output, update_surface_primary_scanout_output,
+    with_surfaces_surface_tree,
+};
 use smithay::desktop::{PopupManager, Space, Window, layer_map_for_output};
 use smithay::input::keyboard::Keysym;
 use smithay::input::pointer::{CursorImageStatus, PointerHandle};
@@ -299,6 +306,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     /// Send frame callbacks to every visible surface on `output`, once per
     /// presented frame. Lifecycle bookkeeping happens in the backends' idle
     /// callbacks instead, so client I/O isn't blocked on frame presentation.
+    ///
+    /// Surfaces are acked every presented frame; hidden ones (cleared scan-out
+    /// records) fall back to a 1Hz throttle so their frame clocks keep running.
     pub fn send_frame_callbacks(&mut self, output: &Output) {
         let now = self.start_time.elapsed();
         if self.is_locked {
@@ -320,18 +330,74 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             }
         } else {
             let scale = output.current_scale().fractional_scale();
+            // Visible surfaces are acked every presented frame; hidden ones get
+            // one ack per second so their frame clocks keep running (1Hz).
+            let throttle = Some(Duration::from_secs(1));
             for window in self.space.elements() {
-                window.send_frame(output, now, Some(Duration::ZERO), |_, _| {
-                    Some(output.clone())
+                window.send_frame(output, now, throttle, |surface, data| {
+                    surface_primary_scanout_output(surface, data)
                 });
                 self.push_fractional_scale(window.toplevel().unwrap().wl_surface(), scale);
             }
             for layer_surface in layer_map_for_output(output).layers() {
-                layer_surface.send_frame(output, now, Some(Duration::ZERO), |_, _| {
-                    Some(output.clone())
+                layer_surface.send_frame(output, now, throttle, |surface, data| {
+                    surface_primary_scanout_output(surface, data)
                 });
                 self.push_fractional_scale(layer_surface.wl_surface(), scale);
             }
+        }
+    }
+
+    /// Record the output each surface was presented on from the last render
+    /// report; surfaces not presented (hidden windows) lose their record.
+    pub fn update_surface_scanout(&mut self, output: &Output, states: &RenderElementStates) {
+        for window in self.space.elements() {
+            window.with_surfaces(|surface, data| {
+                update_surface_primary_scanout_output(
+                    surface,
+                    output,
+                    data,
+                    None,
+                    states,
+                    default_primary_scanout_output_compare,
+                );
+            });
+        }
+        for layer_surface in layer_map_for_output(output).layers() {
+            layer_surface.with_surfaces(|surface, data| {
+                update_surface_primary_scanout_output(
+                    surface,
+                    output,
+                    data,
+                    None,
+                    states,
+                    default_primary_scanout_output_compare,
+                );
+            });
+        }
+        if let CursorImageStatus::Surface(surface) = &self.cursor_status {
+            with_surfaces_surface_tree(surface, |surface, data| {
+                update_surface_primary_scanout_output(
+                    surface,
+                    output,
+                    data,
+                    None,
+                    states,
+                    default_primary_scanout_output_compare,
+                );
+            });
+        }
+        if let Some(icon) = &self.dnd_icon {
+            with_surfaces_surface_tree(&icon.surface, |surface, data| {
+                update_surface_primary_scanout_output(
+                    surface,
+                    output,
+                    data,
+                    None,
+                    states,
+                    default_primary_scanout_output_compare,
+                );
+            });
         }
     }
 

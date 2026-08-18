@@ -177,7 +177,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .set_status(state.cursor_status.clone());
                 }
 
-                {
+                let visible = state.visible_surfaces(&output);
+                let result = {
                     let (renderer, mut framebuffer) = state.backend_data.backend.bind().unwrap();
                     let scale =
                         smithay::utils::Scale::from(output.current_scale().fractional_scale());
@@ -279,12 +280,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         state.is_locked,
                         &state.lock_surfaces,
                         &state.toplevels,
+                        &visible,
                         custom_elements,
                     );
                     damage_tracker
                         .render_output(renderer, &mut framebuffer, 0, &elements, clear_color)
-                        .unwrap();
-                }
+                        .unwrap()
+                };
+                state.update_surface_scanout(&output, &result.states);
                 state.backend_data.backend.submit(Some(&[damage])).unwrap();
 
                 state.send_frame_callbacks(&output);

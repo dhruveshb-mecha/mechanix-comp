@@ -626,7 +626,10 @@ impl State<UdevData> {
             return;
         }
 
-        let queued = {
+        let visible = self.visible_surfaces(&output);
+
+        let mut queued = false;
+        {
             let Some(renderer) = self.backend_data.renderer.as_mut() else {
                 return;
             };
@@ -757,30 +760,37 @@ impl State<UdevData> {
                     self.is_locked,
                     &self.lock_surfaces,
                     &self.toplevels,
+                    &visible,
                     custom_elements,
                 )
             };
 
-            match surface.drm_output.render_frame(
+            let result = match surface.drm_output.render_frame(
                 renderer,
                 &elements,
                 clear_color,
                 FrameFlags::DEFAULT,
             ) {
-                Ok(result) if !result.is_empty => match surface.drm_output.queue_frame(()) {
-                    Ok(()) => true,
-                    Err(err) => {
-                        warn!("Failed to queue frame: {err}");
-                        false
-                    }
-                },
-                Ok(_) => false,
+                Ok(result) if !result.is_empty => Some(result.states),
+                Ok(_) => None,
                 Err(err) => {
                     warn!("Rendering failed: {err}");
-                    false
+                    None
+                }
+            };
+
+            if let Some(states) = result {
+                match surface.drm_output.queue_frame(()) {
+                    Ok(()) => {
+                        queued = true;
+                        self.update_surface_scanout(&output, &states);
+                    }
+                    Err(err) => {
+                        warn!("Failed to queue frame: {err}");
+                    }
                 }
             }
-        };
+        }
 
         if !queued {
             // No pageflip; still deliver frame callbacks for the commit that woke us.
