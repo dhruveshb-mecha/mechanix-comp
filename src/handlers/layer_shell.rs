@@ -38,19 +38,38 @@ impl<BackendData: Backend + 'static> WlrLayerShellHandler for State<BackendData>
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
-        // Just unmap; toplevel geometry is left as-is.
-        if let Some((mut map, layer)) = self.space.outputs().find_map(|o| {
-            let map = layer_map_for_output(o);
+        let Some(output) = self
+            .space
+            .outputs()
+            .find(|o| {
+                layer_map_for_output(o)
+                    .layers()
+                    .any(|layer| layer.layer_surface() == &surface)
+            })
+            .cloned()
+        else {
+            if self.layer_shell_on_demand_focus.as_ref() == Some(surface.wl_surface()) {
+                self.layer_shell_on_demand_focus = None;
+            }
+            return;
+        };
+
+        let zone_before = layer_map_for_output(&output).non_exclusive_zone();
+        {
+            let mut map = layer_map_for_output(&output);
             let layer = map
                 .layers()
-                .find(|&layer| layer.layer_surface() == &surface)
+                .find(|layer| layer.layer_surface() == &surface)
                 .cloned();
-            layer.map(|layer| (map, layer))
-        }) {
-            map.unmap_layer(&layer);
+            if let Some(layer) = layer {
+                map.unmap_layer(&layer);
+            }
         }
         if self.layer_shell_on_demand_focus.as_ref() == Some(surface.wl_surface()) {
             self.layer_shell_on_demand_focus = None;
+        }
+        if zone_before != layer_map_for_output(&output).non_exclusive_zone() {
+            self.apply_layout(&output);
         }
     }
 
@@ -60,10 +79,9 @@ impl<BackendData: Backend + 'static> WlrLayerShellHandler for State<BackendData>
     }
 }
 
-/// Layer-surface side of a commit: arrange the map, send the initial configure,
-/// and mark newly-mapped `OnDemand` layers (Overlay/Top) so
-/// `update_keyboard_focus` gives them keyboard focus. Returns `true` if
-/// `surface` was a layer surface (so the caller can skip the toplevel path).
+/// Layer-surface side of a commit: arrange the map, send the first configure,
+/// and reflow toplevels if the work zone changed. Returns `true` if `surface`
+/// was a layer surface (so the caller can skip the toplevel path).
 pub fn handle_commit<BackendData: Backend + 'static>(
     state: &mut State<BackendData>,
     surface: &WlSurface,
@@ -91,39 +109,33 @@ pub fn handle_commit<BackendData: Backend + 'static>(
             .initial_configure_sent
     });
 
-    // Arrange before configuring so the client gets its real size. Only reflow
-    // toplevels when the layout actually moved.
-    let (layout_changed, needs_configure, on_demand) = {
+    let (zone_changed, needs_configure, on_demand) = {
         let mut map = layer_map_for_output(&output);
-        let layout_changed = map.arrange();
+        let zone_before = map.non_exclusive_zone();
+        map.arrange();
+        let zone_after = map.non_exclusive_zone();
         let layer = map
             .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
             .unwrap();
-        // Newly-mapped `OnDemand` layers take keyboard focus, but only on
-        // Overlay/Top; Bottom/Background are click-to-focus.
+        if !initial_configure_sent {
+            layer.layer_surface().send_configure();
+        }
+        // Overlay/Top OnDemand layers take keyboard focus on first map; Bottom/Background are click-to-focus.
         let cached = layer.cached_state();
         let on_demand = matches!(cached.layer, Layer::Overlay | Layer::Top)
             && cached.keyboard_interactivity == KeyboardInteractivity::OnDemand;
-        (layout_changed, !initial_configure_sent, on_demand)
+        (
+            zone_before != zone_after,
+            !initial_configure_sent,
+            on_demand,
+        )
     };
 
-    if needs_configure {
-        let map = layer_map_for_output(&output);
-        let layer = map
-            .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
-            .unwrap();
-        layer.layer_surface().send_configure();
+    if zone_changed {
+        state.apply_layout(&output);
     }
-
-    // Reflow the toplevels when the layout changed.
-    if layout_changed {
-        state.reflow_toplevels();
-    }
-
-    // Panels/launchers take keyboard focus on open; applied next frame.
     if needs_configure && on_demand {
         state.layer_shell_on_demand_focus = Some(surface.clone());
     }
-
     true
 }

@@ -67,6 +67,22 @@ pub trait Backend {
 
     fn change_vt(&mut self, _vt: i32) {} // no-op by default
 
+    /// Whether this output can be DPMS-blanked (`zwlr_output_power_v1`).
+    fn output_power_supported(&self, _output: &Output) -> bool {
+        false
+    }
+
+    /// Enable or disable the CRTC. After `on`, the caller must `schedule_render`.
+    fn set_output_dpms(&mut self, _output: &Output, _on: bool) -> bool {
+        false
+    }
+
+    /// Re-activate DRM after a VT switch or resume. Default is a no-op.
+    fn prepare_resume(&mut self) {}
+
+    /// Queue a redraw of `output`; the backend skips ones already pending.
+    fn schedule_render(&mut self, _output: &Output) {}
+
     /// Transform to apply to absolute (touch) input positions for `output`.
     /// Nested winit windows already report positions in window space, so they
     /// want identity; udev/DRM (and trait default) reports them in the output's transformed space.

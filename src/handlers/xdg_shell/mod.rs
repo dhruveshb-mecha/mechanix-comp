@@ -1,7 +1,10 @@
 pub mod decoration;
 
+use std::collections::HashSet;
+
 use crate::backend::Backend;
-use crate::state::{State, WindowKind, WindowMode, WindowState};
+use crate::layout::is_dialog;
+use crate::state::{State, WindowMode, WindowState};
 use smithay::desktop::{
     PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window, WindowSurfaceType,
     find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output,
@@ -9,11 +12,9 @@ use smithay::desktop::{
 use smithay::input::{Seat, pointer::Focus};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::{wl_output, wl_seat, wl_surface::WlSurface};
-use smithay::utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial, Size};
-use smithay::wayland::compositor::with_states;
+use smithay::utils::{SERIAL_COUNTER, Serial};
 use smithay::wayland::shell::xdg::{
-    PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler,
-    XdgShellState, XdgToplevelSurfaceData,
+    PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
 
 impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
@@ -37,7 +38,6 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
             surface.wl_surface().clone(),
             WindowState {
                 window: window.clone(),
-                kind: WindowKind::Normal,
                 mode: WindowMode::Floating,
                 mapped: false,
                 modal: false,
@@ -46,17 +46,13 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        let was_transient = matches!(
-            self.toplevels.get(surface.wl_surface()).map(|ws| ws.kind),
-            Some(WindowKind::Transient(_))
-        );
         // The foreign-toplevel `closed` event is sent by
         // `foreign_toplevel_refresh` on the next idle callback.
-        self.toplevels.remove(surface.wl_surface());
-        if was_transient {
-            // Transients never joined the `Space`; nothing to restore.
-            return;
+        let wl = surface.wl_surface();
+        for layout in self.layouts.values_mut() {
+            layout.remove(wl);
         }
+        self.toplevels.remove(wl);
         let window = self
             .space
             .elements()
@@ -68,17 +64,14 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         }
     }
 
-    fn title_changed(&mut self, surface: ToplevelSurface) {
-        self.promote_transient(&surface);
-        // Title is picked up by `foreign_toplevel_refresh` on the next idle.
-    }
-
-    fn app_id_changed(&mut self, surface: ToplevelSurface) {
-        self.promote_transient(&surface);
-    }
-
     fn parent_changed(&mut self, surface: ToplevelSurface) {
-        self.promote_transient(&surface);
+        let mapped = self
+            .toplevels
+            .get(surface.wl_surface())
+            .is_some_and(|ws| ws.mapped);
+        if mapped && let Some(output) = self.primary_output() {
+            self.apply_layout(&output);
+        }
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -141,39 +134,25 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
         // Dialogs are never maximized.
-        if surface.parent().is_some() {
+        if is_dialog(&surface) {
             return;
         }
-        // A fullscreen window keeps its mode; the stale-flag re-check would
-        // otherwise bounce it to a maximized look.
+        // A fullscreen window keeps its mode.
         if matches!(
             self.toplevels.get(surface.wl_surface()).map(|ws| ws.mode),
             Some(WindowMode::Fullscreen)
         ) {
             return;
         }
-        let zone = self
-            .space
-            .outputs()
-            .next()
-            .map(|o| layer_map_for_output(o).non_exclusive_zone());
-        if let Some(zone) = zone {
-            // Fixed-size windows can't be maximized.
-            if !fills_zone(surface.wl_surface(), zone.size) {
-                return;
-            }
-            surface.with_pending_state(|state| {
-                state.size = Some(zone.size);
-                state.states.set(xdg_toplevel::State::Maximized);
-            });
-            self.toplevels.get_mut(surface.wl_surface()).unwrap().mode = WindowMode::Maximized;
+        if let Some(output) = self.primary_output() {
+            self.apply_layout(&output);
         }
         surface.send_configure();
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
         // Dialogs are never maximized, so ignore restore requests.
-        if surface.parent().is_some() {
+        if is_dialog(&surface) {
             return;
         }
         // Not maximized (e.g. the spurious restore GTK sends on a floating
@@ -184,21 +163,8 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
-        let zone = self
-            .space
-            .outputs()
-            .next()
-            .map(|o| layer_map_for_output(o).non_exclusive_zone());
-        if let Some(zone) = zone {
-            // Fixed-size windows are never maximized.
-            if !fills_zone(surface.wl_surface(), zone.size) {
-                return;
-            }
-            // Windows cannot be un-maximized. Re-confirm maximized state.
-            surface.with_pending_state(|state| {
-                state.size = Some(zone.size);
-                state.states.set(xdg_toplevel::State::Maximized);
-            });
+        if let Some(output) = self.primary_output() {
+            self.apply_layout(&output);
         }
         surface.send_configure();
     }
@@ -209,7 +175,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         _output: Option<wl_output::WlOutput>,
     ) {
         // Dialogs are never fullscreen.
-        if surface.parent().is_some() {
+        if is_dialog(&surface) {
             return;
         }
         if matches!(
@@ -224,10 +190,6 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
             .next()
             .and_then(|o| self.space.output_geometry(o));
         if let Some(geo) = output_geo {
-            // Fixed-size windows can't be fullscreened.
-            if !fills_zone(surface.wl_surface(), geo.size) {
-                return;
-            }
             surface.with_pending_state(|state| {
                 state.size = Some(geo.size);
                 state.states.set(xdg_toplevel::State::Fullscreen);
@@ -236,14 +198,11 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         }
         surface.send_configure();
 
-        // Fullscreen windows stack above every other toplevel and keep the
-        // keyboard focus.
         let window = self
             .toplevels
             .get(surface.wl_surface())
             .map(|ws| ws.window.clone());
         if let Some(window) = window {
-            self.space.raise_element(&window, false);
             self.focus_window(&window, SERIAL_COUNTER.next_serial());
         }
     }
@@ -257,19 +216,9 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
-        let zone = self
-            .space
-            .outputs()
-            .next()
-            .map(|o| layer_map_for_output(o).non_exclusive_zone());
-        if let Some(zone) = zone {
-            // Return to maximized state.
-            surface.with_pending_state(|state| {
-                state.size = Some(zone.size);
-                state.states.unset(xdg_toplevel::State::Fullscreen);
-                state.states.set(xdg_toplevel::State::Maximized);
-            });
-            self.toplevels.get_mut(surface.wl_surface()).unwrap().mode = WindowMode::Maximized;
+        self.toplevels.get_mut(surface.wl_surface()).unwrap().mode = WindowMode::Maximized;
+        if let Some(output) = self.primary_output() {
+            self.apply_layout(&output);
         }
         surface.send_configure();
     }
@@ -283,62 +232,51 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         {
             return;
         }
-        // Raise + activate (the pending Activated state), then flush to clients.
-        self.space.raise_element(window, true);
-        for toplevel in self
-            .space
-            .elements()
-            .map(|element| element.toplevel().unwrap().clone())
-        {
-            if toplevel.is_initial_configure_sent() {
-                toplevel.send_pending_configure();
-            }
-        }
 
-        // Remember the active window so focus can be restored when no layer
-        // holds it; focusing a window also drops any on-demand layer focus.
-        self.active_window = Some(window.toplevel().unwrap().wl_surface().clone());
+        let focused_surface = window.toplevel().unwrap().wl_surface().clone();
+        self.active_window = Some(focused_surface.clone());
         self.layer_shell_on_demand_focus = None;
 
-        self.seat.get_keyboard().unwrap().set_focus(
-            self,
-            Some(window.toplevel().unwrap().wl_surface().clone()),
-            serial,
-        );
+        if let Some(output) = self.primary_output() {
+            self.apply_layout(&output);
+        }
+
+        let group = self.active_group();
+        self.set_activated_group(&group);
+
+        self.seat
+            .get_keyboard()
+            .unwrap()
+            .set_focus(self, Some(focused_surface), serial);
     }
 
-    pub fn reflow_toplevels(&mut self) {
-        let Some(output) = self.space.outputs().next().cloned() else {
-            return;
-        };
-        let zone = layer_map_for_output(&output).non_exclusive_zone();
-
-        let windows: Vec<Window> = self.space.elements().cloned().collect();
-        for window in windows {
-            let toplevel = window.toplevel().unwrap();
-            if toplevel.parent().is_some() {
-                // Keep dialogs centered over (and stacked above) their parent.
-                self.center_child_toplevel(&window);
-                continue;
-            }
-            if fills_zone(toplevel.wl_surface(), zone.size) {
-                toplevel.with_pending_state(|state| {
-                    state.size = Some(zone.size);
-                });
-                if toplevel.is_initial_configure_sent() {
-                    toplevel.send_pending_configure();
+    /// Set the xdg `activated` state on every toplevel in `group` and clear it
+    /// on the others, then flush the pending states to clients.
+    fn set_activated_group(&mut self, group: &HashSet<WlSurface>) {
+        for element in self.space.elements() {
+            let toplevel = element.toplevel().unwrap();
+            let is_active = group.contains(toplevel.wl_surface());
+            toplevel.with_pending_state(|state| {
+                if is_active {
+                    state.states.set(xdg_toplevel::State::Activated);
+                } else {
+                    state.states.unset(xdg_toplevel::State::Activated);
                 }
-                self.space.relocate_element(&window, zone.loc);
-            } else {
-                // Fixed-size window: keep it centered, don't re-size it.
-                self.space
-                    .relocate_element(&window, centered_loc(zone, window.geometry()));
+            });
+            if toplevel.is_initial_configure_sent() {
+                toplevel.send_pending_configure();
             }
         }
     }
 
     pub fn focus_topmost(&mut self) {
-        let topmost = self.space.elements().next_back().cloned();
+        let topmost = self
+            .space
+            .outputs()
+            .next()
+            .and_then(|o| self.layouts.get(o))
+            .and_then(|layout| layout.top().cloned())
+            .and_then(|s| self.toplevels.get(&s).map(|ws| ws.window.clone()));
         if let Some(window) = topmost {
             self.focus_window(&window, SERIAL_COUNTER.next_serial());
         } else {
@@ -350,130 +288,32 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// Map a toplevel on its first commit, or promote a transient that gained a title/app_id/parent. Returns true if kept as a transient.
-    fn handle_toplevel_first_commit(&mut self, surface: &WlSurface, window: &Window) -> bool {
+    /// Map a toplevel on its first commit.
+    fn handle_toplevel_first_commit(&mut self, surface: &WlSurface, window: &Window) {
         let toplevel = window.toplevel().unwrap();
-        let (title, app_id) = toplevel_title_app_id(surface);
+        let output = self.space.outputs().next().cloned();
+        let loc = output
+            .as_ref()
+            .map(|o| layer_map_for_output(o).non_exclusive_zone().loc)
+            .unwrap_or_default();
 
-        if toplevel.parent().is_none() && title.is_empty() && app_id.is_empty() {
-            // GTK3 tooltip fallback: float at the pointer, never focus/maximize (0x0 configure = client picks its size).
-            toplevel.with_pending_state(|pending| {
-                pending.size = None;
-                pending.states.unset(xdg_toplevel::State::Maximized);
-            });
-            toplevel.send_configure();
-            let loc = self
-                .seat
-                .get_pointer()
-                .map(|p| p.current_location().to_i32_round() + Point::from((12, 24)))
-                .unwrap_or_default();
-            let ws = self.toplevels.get_mut(surface).unwrap();
-            ws.kind = WindowKind::Transient(loc);
-            ws.mapped = true;
-            return true;
+        if let Some(output) = &output {
+            self.layouts
+                .entry(output.clone())
+                .or_default()
+                .insert(surface.clone());
         }
 
-        let zone = self
-            .space
-            .outputs()
-            .next()
-            .map(|o| layer_map_for_output(o).non_exclusive_zone());
-        let is_dialog = toplevel.parent().is_some();
-        let fills = !is_dialog
-            && zone
-                .as_ref()
-                .map(|z| fills_zone(surface, z.size))
-                .unwrap_or(true);
-        let ws = self.toplevels.get_mut(surface).unwrap();
-        ws.kind = if is_dialog {
-            WindowKind::Dialog
-        } else {
-            WindowKind::Normal
-        };
-        ws.mode = if !is_dialog && fills {
-            WindowMode::Maximized
-        } else {
-            WindowMode::Floating
-        };
-        if !is_dialog && let Some(zone) = zone {
-            toplevel.with_pending_state(|pending| {
-                if fills {
-                    pending.size = Some(zone.size);
-                    pending.states.set(xdg_toplevel::State::Maximized);
-                } else {
-                    pending.size = None;
-                    pending.bounds = Some(zone.size);
-                    pending.states.unset(xdg_toplevel::State::Maximized);
-                }
-            });
-        }
-
-        let loc = if is_dialog {
-            (0, 0).into()
-        } else if let Some(zone) = zone {
-            if fills {
-                zone.loc
-            } else {
-                centered_loc(zone, window.geometry())
-            }
-        } else {
-            (0, 0).into()
-        };
-        // Don't activate/raise a new window over an active fullscreen one.
-        let activate = self.active_fullscreen_window().is_none();
-        self.space.map_element(window.clone(), loc, activate);
-        self.focus_window(window, SERIAL_COUNTER.next_serial());
+        self.space.map_element(window.clone(), loc, false);
         self.toplevels.get_mut(surface).unwrap().mapped = true;
-        toplevel.send_configure();
-        if is_dialog {
-            self.center_child_toplevel(window);
+        if self.active_fullscreen_window().is_none() {
+            self.focus_window(window, SERIAL_COUNTER.next_serial());
+        } else if let Some(output) = &output {
+            self.apply_layout(output);
         }
-        false
-    }
-
-    fn promote_transient(&mut self, surface: &ToplevelSurface) {
-        let wl_surface = surface.wl_surface();
-        let Some(window) = self
-            .toplevels
-            .get(wl_surface)
-            .filter(|ws| matches!(ws.kind, WindowKind::Transient(_)))
-            .map(|ws| ws.window.clone())
-        else {
-            return;
-        };
-        self.handle_toplevel_first_commit(wl_surface, &window);
-    }
-
-    pub fn center_child_toplevel(&mut self, window: &Window) {
-        let Some(toplevel) = window.toplevel() else {
-            return;
-        };
-        let Some(parent_surface) = toplevel.parent() else {
-            return;
-        };
-
-        let Some(parent_window) = self
-            .space
-            .elements()
-            .find(|w| w.toplevel().unwrap().wl_surface() == &parent_surface)
-            .cloned()
-        else {
-            return;
-        };
-
-        let Some(parent_geo) = self.space.element_geometry(&parent_window) else {
-            return;
-        };
-        let child_geo = window.geometry();
-
-        let new_pos = Point::from((
-            parent_geo.loc.x + (parent_geo.size.w - child_geo.size.w) / 2,
-            parent_geo.loc.y + (parent_geo.size.h - child_geo.size.h) / 2,
-        ));
-        self.space.relocate_element(window, new_pos);
-        // Keep the dialog stacked above its parent (idempotent).
-        self.space
-            .raise_element_above(window, &parent_window, false);
+        if !toplevel.is_initial_configure_sent() {
+            toplevel.send_configure();
+        }
     }
 
     fn unconstrain_popup(&self, popup: &PopupSurface) {
@@ -540,47 +380,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 }
 
-/// The toplevel's current title and app_id.
-fn toplevel_title_app_id(surface: &WlSurface) -> (String, String) {
-    with_states(surface, |states| {
-        let attrs = states
-            .data_map
-            .get::<XdgToplevelSurfaceData>()
-            .unwrap()
-            .lock()
-            .unwrap();
-        (
-            attrs.title.clone().unwrap_or_default(),
-            attrs.app_id.clone().unwrap_or_default(),
-        )
-    })
-}
-
-/// Whether the toplevel's declared max size can fill `zone`. Fixed-size
-/// windows (`set_max_size` smaller than the zone) are never maximized.
-fn fills_zone(surface: &WlSurface, zone: Size<i32, Logical>) -> bool {
-    let max_size = with_states(surface, |states| {
-        states
-            .cached_state
-            .get::<SurfaceCachedState>()
-            .current()
-            .max_size
-    });
-    (max_size.w == 0 || max_size.w >= zone.w) && (max_size.h == 0 || max_size.h >= zone.h)
-}
-
-/// Center `geo` within `zone`, clamped to keep its top-left inside the zone.
-fn centered_loc(
-    zone: Rectangle<i32, Logical>,
-    geo: Rectangle<i32, Logical>,
-) -> Point<i32, Logical> {
-    Point::from((
-        zone.loc.x + (zone.size.w - geo.size.w).max(0) / 2,
-        zone.loc.y + (zone.size.h - geo.size.h).max(0) / 2,
-    ))
-}
-
-/// Toplevel commit handler: first-commit map, keeps transients in-bounds and dialogs centered. Returns true for toplevels (skip popup path).
+/// Toplevel commit handler: first-commit map, keeps dialogs centered. Returns true for toplevels (skip popup path).
 pub fn handle_commit<BackendData: Backend + 'static>(
     state: &mut State<BackendData>,
     surface: &WlSurface,
@@ -594,74 +394,12 @@ pub fn handle_commit<BackendData: Backend + 'static>(
     };
 
     if !mapped {
-        if state.handle_toplevel_first_commit(surface, &window) {
-            return true;
-        }
-    } else if let Some(ws) = state.toplevels.get_mut(surface) {
-        if let WindowKind::Transient(loc) = &mut ws.kind
-            && let Some(geo) = state
-                .space
-                .outputs()
-                .next()
-                .and_then(|o| state.space.output_geometry(o))
-        {
-            let size = window.geometry().size;
-            if size.w <= geo.size.w && size.h <= geo.size.h {
-                loc.x = loc.x.clamp(geo.loc.x, geo.loc.x + geo.size.w - size.w);
-                loc.y = loc.y.clamp(geo.loc.y, geo.loc.y + geo.size.h - size.h);
-            }
-        }
+        state.handle_toplevel_first_commit(surface, &window);
+        return true;
     }
 
-    // Re-check the maximize decision once size hints arrive (GTK sends
-    // `set_max_size` only after the initial configure); un-maximize and
-    // re-center fixed-size windows.
-    let toplevel = window.toplevel().unwrap();
-    let zone = state
-        .space
-        .outputs()
-        .next()
-        .map(|o| layer_map_for_output(o).non_exclusive_zone());
-    if toplevel.parent().is_none()
-        && toplevel.is_initial_configure_sent()
-        && !matches!(
-            state.toplevels.get(surface).map(|ws| ws.mode),
-            Some(WindowMode::Fullscreen)
-        )
-        && let Some(zone) = zone
-    {
-        let fills = fills_zone(surface, zone.size);
-        let maximized = toplevel.with_committed_state(|s| {
-            s.is_some_and(|s| s.states.contains(xdg_toplevel::State::Maximized))
-        });
-        if fills != maximized {
-            state.toplevels.get_mut(surface).unwrap().mode = if fills {
-                WindowMode::Maximized
-            } else {
-                WindowMode::Floating
-            };
-            toplevel.with_pending_state(|pending| {
-                if fills {
-                    pending.size = Some(zone.size);
-                    pending.states.set(xdg_toplevel::State::Maximized);
-                } else {
-                    pending.size = None;
-                    pending.bounds = Some(zone.size);
-                    pending.states.unset(xdg_toplevel::State::Maximized);
-                }
-            });
-            toplevel.send_pending_configure();
-            if !fills {
-                state
-                    .space
-                    .relocate_element(&window, centered_loc(zone, window.geometry()));
-            }
-        }
-    }
-
-    if window.toplevel().unwrap().parent().is_some() {
-        // Keep dialogs centered over (and stacked above) their parent.
-        state.center_child_toplevel(&window);
+    if let Some(output) = state.primary_output() {
+        state.apply_layout(&output);
     }
     true
 }

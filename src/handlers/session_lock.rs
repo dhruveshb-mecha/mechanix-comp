@@ -32,6 +32,8 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
         self.is_locked = false;
         self.lock_surfaces.clear();
         self.focus_topmost();
+        // The lock frame is still on the CRTC until the next redraw.
+        self.schedule_render();
     }
 
     fn new_surface(&mut self, surface: LockSurface, wl_output: WlOutput) {

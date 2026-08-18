@@ -37,5 +37,7 @@ impl<BackendData: Backend + 'static> CompositorHandler for State<BackendData> {
 
         self.popups.commit(surface);
         self.ensure_initial_configure(surface);
+        // A commit is new damage; render on demand instead of polling.
+        self.schedule_render();
     }
 }

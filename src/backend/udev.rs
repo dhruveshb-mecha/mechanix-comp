@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -91,11 +91,18 @@ pub struct UdevData {
     renderer: Option<GlesRenderer>,
     devices: HashMap<DrmNode, DeviceData>,
     keyboards: Vec<smithay::reexports::input::Device>,
+    /// Connected pointer devices; the software cursor renders only while non-empty.
+    pointers: Vec<smithay::reexports::input::Device>,
+    /// True once a pointer device has actually moved; a phantom pointer (e.g.
+    /// the HDMI controller) must not summon a cursor stuck at (0,0).
+    pointer_moved: bool,
     /// Loaded xcursor theme used to pick the current cursor frame.
     pointer_image: crate::cursor::Cursor,
     /// Cache of imported cursor frames, keyed by the raw xcursor image.
     pointer_images: Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
     pointer_element: PointerElement,
+    /// CRTCs with a render already queued, so `schedule_render` on them is a no-op.
+    pending_render: HashSet<(DrmNode, crtc::Handle)>,
 }
 
 impl Backend for UdevData {
@@ -123,6 +130,58 @@ impl Backend for UdevData {
         if let Err(err) = self.session.change_vt(vt) {
             error!(vt, "Error switching vt: {}", err);
         }
+    }
+
+    fn output_power_supported(&self, output: &Output) -> bool {
+        output.user_data().get::<UdevOutputId>().is_some()
+    }
+
+    fn set_output_dpms(&mut self, output: &Output, on: bool) -> bool {
+        let Some(id) = output.user_data().get::<UdevOutputId>().copied() else {
+            return false;
+        };
+        let Some(device) = self.devices.get_mut(&id.device_id) else {
+            return false;
+        };
+        let Some(surface) = device.surfaces.get_mut(&id.crtc) else {
+            return false;
+        };
+        if on {
+            // clear() left the CRTC inactive; the next queue_frame must modeset.
+            surface.drm_output.reset_buffers();
+            return true;
+        }
+        match surface.drm_output.with_compositor(|c| c.clear()) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!("DPMS off failed on {}: {err}", output.name());
+                false
+            }
+        }
+    }
+
+    fn prepare_resume(&mut self) {
+        for (node, device) in &mut self.devices {
+            if let Err(err) = device.drm_output_manager.lock().activate(false) {
+                warn!("Failed to activate DRM device {node} after resume: {err}");
+            }
+        }
+    }
+
+    fn schedule_render(&mut self, output: &Output) {
+        let Some(id) = output.user_data().get::<UdevOutputId>().copied() else {
+            return;
+        };
+        if !self.pending_render.insert((id.device_id, id.crtc)) {
+            return;
+        }
+        self.loop_handle.insert_idle(move |state| {
+            state
+                .backend_data
+                .pending_render
+                .remove(&(id.device_id, id.crtc));
+            state.render_surface(id.device_id, id.crtc);
+        });
     }
 }
 
@@ -164,9 +223,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         renderer: None,
         devices: HashMap::new(),
         keyboards: Vec::new(),
+        pointers: Vec::new(),
+        pointer_moved: false,
         pointer_image: crate::cursor::Cursor::load(),
         pointer_images: Vec::new(),
         pointer_element: PointerElement::default(),
+        pending_render: HashSet::new(),
     };
 
     let mut state = State::new(&mut event_loop, display, udev_data);
@@ -196,10 +258,29 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     data.backend_data.keyboards.push(device.clone());
                 }
+                if device.has_capability(DeviceCapability::Pointer) {
+                    data.backend_data.pointers.push(device.clone());
+                    data.backend_data.pointer_moved = false;
+                }
             } else if let InputEvent::DeviceRemoved { ref device } = event {
                 if device.has_capability(DeviceCapability::Keyboard) {
                     data.backend_data.keyboards.retain(|item| item != device);
                 }
+                if device.has_capability(DeviceCapability::Pointer) {
+                    data.backend_data.pointers.retain(|item| item != device);
+                    if data.backend_data.pointers.is_empty() {
+                        data.backend_data.pointer_moved = false;
+                    }
+                }
+            }
+
+            // A real pointer moving is what summons the cursor; touch and the
+            // phantom HDMI "pointer" never move it.
+            if matches!(
+                event,
+                InputEvent::PointerMotion { .. } | InputEvent::PointerMotionAbsolute { .. }
+            ) {
+                data.backend_data.pointer_moved = true;
             }
 
             data.process_input_event(event)
@@ -232,40 +313,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             SessionEvent::ActivateSession => {
                 info!("session resumed");
-                let nodes: Vec<DrmNode> = state.backend_data.devices.keys().copied().collect();
-                for node in nodes {
-                    let crtcs: Vec<crtc::Handle> = match state.backend_data.devices.get_mut(&node) {
-                        Some(device) => {
-                            if let Err(err) = device.drm_output_manager.lock().activate(false) {
-                                warn!("Failed to activate DRM device {node}: {err}");
-                            }
-                            device.surfaces.keys().copied().collect()
-                        }
-                        None => continue,
-                    };
-
-                    // The previous swapchain buffers are stale after a VT switch;
-                    // discard them so the next frame is a clean full render.
-                    let outputs: Vec<Output> = state
-                        .space
-                        .outputs()
-                        .filter(|o| {
-                            o.user_data()
-                                .get::<UdevOutputId>()
-                                .is_some_and(|id| id.device_id == node)
-                        })
-                        .cloned()
-                        .collect();
-                    for output in &outputs {
-                        state.backend_data.reset_buffers(output);
-                    }
-
-                    for crtc in crtcs {
-                        state.backend_data.loop_handle.insert_idle(move |state| {
-                            state.render_surface(node, crtc);
-                        });
-                    }
-                }
+                state.resume_drm_session();
             }
         })?;
 
@@ -574,6 +622,7 @@ impl State<UdevData> {
             })
             .cloned();
         if let Some(output) = output {
+            self.output_power.output_removed(&output);
             self.space.unmap_output(&output);
         }
     }
@@ -593,27 +642,20 @@ impl State<UdevData> {
         }
     }
 
-    /// Render one CRTC. On damage, queue a pageflip and wait for the vblank
-    /// (`frame_finish` re-arms). On no damage, re-arm a poll ~one frame later.
+    /// Render one CRTC: queue a pageflip on damage, deliver frame callbacks otherwise.
     fn render_surface(&mut self, node: DrmNode, crtc: crtc::Handle) {
-        let Some(output) = self
-            .space
-            .outputs()
-            .find(|o| {
-                o.user_data().get::<UdevOutputId>()
-                    == Some(&UdevOutputId {
-                        device_id: node,
-                        crtc,
-                    })
-            })
-            .cloned()
-        else {
+        let Some(output) = self.output_for_crtc(node, crtc) else {
             return;
         };
 
-        let frame_duration = frame_duration(&output);
+        if self.output_power.is_off(&output) {
+            return;
+        }
 
-        let queued = {
+        let visible = self.visible_surfaces(&output);
+
+        let mut queued = false;
+        {
             let Some(renderer) = self.backend_data.renderer.as_mut() else {
                 return;
             };
@@ -632,7 +674,11 @@ impl State<UdevData> {
                 let pointer_location = self.pointer.current_location();
 
                 let mut custom_elements: Vec<Element> = Vec::new();
-                if output_geometry.to_f64().contains(pointer_location) {
+                // Render the cursor only after a real pointer has moved; the
+                // touch-only panel (and phantom devices) never summon it.
+                let pointer_present =
+                    self.backend_data.pointer_moved && !self.backend_data.pointers.is_empty();
+                if pointer_present && output_geometry.to_f64().contains(pointer_location) {
                     let cursor_hotspot =
                         if let CursorImageStatus::Surface(surface) = &self.cursor_status {
                             with_states(surface, |states| {
@@ -744,41 +790,43 @@ impl State<UdevData> {
                     self.is_locked,
                     &self.lock_surfaces,
                     &self.toplevels,
+                    &visible,
                     custom_elements,
                 )
             };
 
-            match surface.drm_output.render_frame(
+            let result = match surface.drm_output.render_frame(
                 renderer,
                 &elements,
                 clear_color,
                 FrameFlags::DEFAULT,
             ) {
-                Ok(result) if !result.is_empty => match surface.drm_output.queue_frame(()) {
-                    Ok(()) => true,
-                    Err(err) => {
-                        warn!("Failed to queue frame: {err}");
-                        false
-                    }
-                },
-                Ok(_) => false,
+                Ok(result) if !result.is_empty => Some(result.states),
+                Ok(_) => None,
                 Err(err) => {
                     warn!("Rendering failed: {err}");
-                    false
+                    None
+                }
+            };
+
+            if let Some(states) = result {
+                match surface.drm_output.queue_frame(()) {
+                    Ok(()) => {
+                        queued = true;
+                        self.update_surface_scanout(&output, &states);
+                    }
+                    Err(err) => {
+                        warn!("Failed to queue frame: {err}");
+                    }
                 }
             }
-        };
+        }
 
         if !queued {
-            // No pageflip pending; poll again after one refresh interval.
-            let timer = Timer::from_duration(frame_duration);
-            let _ = self
-                .backend_data
-                .loop_handle
-                .insert_source(timer, move |_, _, state| {
-                    state.render_surface(node, crtc);
-                    TimeoutAction::Drop
-                });
+            // No pageflip; still deliver frame callbacks for the commit that woke us.
+            self.send_frame_callbacks(&output);
+            // Keep repainting so surface removals get re-rendered.
+            self.schedule_repaint(&output);
         }
     }
 
@@ -802,30 +850,56 @@ impl State<UdevData> {
             }
         }
 
-        let output = self
-            .space
-            .outputs()
-            .find(|o| {
-                o.user_data().get::<UdevOutputId>()
-                    == Some(&UdevOutputId {
-                        device_id: node,
-                        crtc,
-                    })
-            })
-            .cloned();
-        if let Some(output) = output {
+        if let Some(output) = self.output_for_crtc(node, crtc) {
             self.send_frame_callbacks(&output);
-            self.backend_data.loop_handle.insert_idle(move |state| {
-                state.render_surface(node, crtc);
-            });
+            self.schedule_repaint(&output);
         }
     }
-}
 
-fn frame_duration(output: &Output) -> Duration {
-    output
-        .current_mode()
-        .filter(|mode| mode.refresh > 0)
-        .map(|mode| Duration::from_secs_f64(1000.0 / mode.refresh as f64))
-        .unwrap_or_else(|| Duration::from_millis(16))
+    /// Schedule the next repaint after a short delay: frame-callback-driven
+    /// clients repaint during it, and late changes (e.g. surface removal) are
+    /// picked up instead of leaving a stale frame on the CRTC.
+    fn schedule_repaint(&mut self, output: &Output) {
+        let Some(id) = output.user_data().get::<UdevOutputId>().copied() else {
+            return;
+        };
+        if !self
+            .backend_data
+            .pending_render
+            .insert((id.device_id, id.crtc))
+        {
+            return;
+        }
+        let frame_duration = output
+            .current_mode()
+            .map(|mode| Duration::from_secs_f64(1_000f64 / mode.refresh as f64))
+            .unwrap_or(Duration::from_millis(16));
+        let repaint_delay = Duration::from_secs_f64(frame_duration.as_secs_f64() * 0.6);
+        if self
+            .backend_data
+            .loop_handle
+            .insert_source(Timer::from_duration(repaint_delay), move |_, _, state| {
+                state
+                    .backend_data
+                    .pending_render
+                    .remove(&(id.device_id, id.crtc));
+                state.render_surface(id.device_id, id.crtc);
+                TimeoutAction::Drop
+            })
+            .is_err()
+        {
+            warn!("failed to schedule repaint");
+        }
+    }
+
+    fn output_for_crtc(&self, node: DrmNode, crtc: crtc::Handle) -> Option<Output> {
+        let id = UdevOutputId {
+            device_id: node,
+            crtc,
+        };
+        self.space
+            .outputs()
+            .find(|o| o.user_data().get() == Some(&id))
+            .cloned()
+    }
 }

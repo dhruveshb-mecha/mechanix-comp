@@ -95,14 +95,19 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         let modal = self.active_modal_window();
         if let Some((window, location)) = self.space.element_under(pos) {
+            // Hidden windows are outside the active group: skip them so clicks
+            // in the clear area don't reach what isn't shown.
+            let in_group = window
+                .toplevel()
+                .is_some_and(|t| self.active_group().contains(t.wl_surface()));
             // A modal dialog blocks input to every other window.
-            if modal.as_ref().is_none_or(|m| m == window) {
-                if let Some((surface, loc)) = window
+            if in_group
+                && modal.as_ref().is_none_or(|m| m == window)
+                && let Some((surface, loc)) = window
                     .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
                     .map(|(s, p)| (s, (p + location).to_f64()))
-                {
-                    return Some((surface, loc));
-                }
+            {
+                return Some((surface, loc));
             }
         }
 
@@ -235,7 +240,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         };
 
         let serial = SERIAL_COUNTER.next_serial();
-        // self.update_keyboard_focus(touch_location, serial);
+        if !handle.is_grabbed() {
+            self.assign_pointer_click_focus(touch_location, serial);
+        }
 
         let under = self.surface_under(touch_location);
         handle.down(
@@ -307,7 +314,66 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     fn on_device_removed<B: InputBackend>(&mut self, _device: B::Device) {}
 
+    /// Same focus policy for pointer press and touch down: OnDemand layers, else the window, else lower layers.
+    fn assign_pointer_click_focus(
+        &mut self,
+        pos: Point<f64, Logical>,
+        serial: smithay::utils::Serial,
+    ) {
+        if self.is_locked {
+            if let Some((surface, _)) = self.surface_under(pos) {
+                self.seat
+                    .get_keyboard()
+                    .unwrap()
+                    .set_focus(self, Some(surface), serial);
+            }
+            return;
+        }
+
+        let layer_under = |kinds: [WlrLayer; 2]| {
+            self.space.outputs().next().cloned().and_then(|output| {
+                let output_geo = self.space.output_geometry(&output)?;
+                let map = layer_map_for_output(&output);
+                let pos = pos - output_geo.loc.to_f64();
+                topmost_accepting_layer(&*map, pos, kinds).map(|layer| {
+                    let on_demand = layer.cached_state().keyboard_interactivity
+                        == KeyboardInteractivity::OnDemand;
+                    (layer.wl_surface().clone(), on_demand)
+                })
+            })
+        };
+
+        // Overlay/Top layers win the click; a fullscreen window covers everything but Overlay.
+        let upper_kinds = if self.active_fullscreen_window().is_some() {
+            [WlrLayer::Overlay, WlrLayer::Overlay]
+        } else {
+            [WlrLayer::Overlay, WlrLayer::Top]
+        };
+        if let Some((surface, on_demand)) = layer_under(upper_kinds) {
+            if on_demand {
+                self.layer_shell_on_demand_focus = Some(surface);
+            }
+        } else if let Some(window) = self.space.element_under(pos).map(|(w, _)| w.clone()) {
+            // Modal dialogs keep the parent focused.
+            let modal = self.active_modal_window();
+            if modal.as_ref().is_none_or(|m| m == &window) {
+                self.focus_window(&window, serial);
+            }
+        } else if self.active_fullscreen_window().is_none()
+            && let Some((surface, on_demand)) =
+                layer_under([WlrLayer::Bottom, WlrLayer::Background])
+        {
+            if on_demand {
+                self.layer_shell_on_demand_focus = Some(surface);
+            }
+        }
+    }
+
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
+        // Wake blanked outputs on any input; consume the event that woke them.
+        if self.wake_outputs_if_off() {
+            return;
+        }
         // Any input event counts as user activity: reset the idle-notify
         // timers so `swayidle`-style clients don't go idle while the user is
         // using the compositor. The notifier itself keeps inhibited seats
@@ -350,7 +416,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             }
             InputEvent::PointerButton { event, .. } => {
                 let pointer = self.seat.get_pointer().unwrap();
-                let keyboard = self.seat.get_keyboard().unwrap();
 
                 let serial = SERIAL_COUNTER.next_serial();
 
@@ -359,58 +424,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 let button_state = event.state();
 
                 if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
-                    let pos = pointer.current_location();
-                    if self.is_locked {
-                        if let Some((surface, _)) = self.surface_under(pos) {
-                            keyboard.set_focus(self, Some(surface), serial);
-                        }
-                    } else {
-                        // The click is delivered to the accepting layer via
-                        // `pointer.button`; keyboard focus is applied centrally
-                        // by `update_keyboard_focus` from the on-demand marker.
-                        // Only `OnDemand` layers set the marker; clicking an
-                        // Exclusive/None layer or empty desktop leaves focus alone.
-                        let layer_under = |kinds: [WlrLayer; 2]| {
-                            self.space.outputs().next().cloned().and_then(|output| {
-                                let output_geo = self.space.output_geometry(&output)?;
-                                let map = layer_map_for_output(&output);
-                                let pos = pos - output_geo.loc.to_f64();
-                                topmost_accepting_layer(&*map, pos, kinds).map(|layer| {
-                                    let on_demand = layer.cached_state().keyboard_interactivity
-                                        == KeyboardInteractivity::OnDemand;
-                                    (layer.wl_surface().clone(), on_demand)
-                                })
-                            })
-                        };
-
-                        // Overlay/Top layers win the click; a fullscreen window
-                        // covers everything but the Overlay layer.
-                        let upper_kinds = if self.active_fullscreen_window().is_some() {
-                            [WlrLayer::Overlay, WlrLayer::Overlay]
-                        } else {
-                            [WlrLayer::Overlay, WlrLayer::Top]
-                        };
-                        if let Some((surface, on_demand)) = layer_under(upper_kinds) {
-                            if on_demand {
-                                self.layer_shell_on_demand_focus = Some(surface);
-                            }
-                        } else if let Some(window) =
-                            self.space.element_under(pos).map(|(w, _)| w.clone())
-                        {
-                            // Modal dialogs keep the parent focused.
-                            let modal = self.active_modal_window();
-                            if modal.as_ref().is_none_or(|m| m == &window) {
-                                self.focus_window(&window, serial);
-                            }
-                        } else if self.active_fullscreen_window().is_none()
-                            && let Some((surface, on_demand)) =
-                                layer_under([WlrLayer::Bottom, WlrLayer::Background])
-                        {
-                            if on_demand {
-                                self.layer_shell_on_demand_focus = Some(surface);
-                            }
-                        }
-                    }
+                    self.assign_pointer_click_focus(pointer.current_location(), serial);
                 };
 
                 pointer.button(
