@@ -127,6 +127,42 @@ impl Backend for UdevData {
         }
     }
 
+    fn output_power_supported(&self, output: &Output) -> bool {
+        output.user_data().get::<UdevOutputId>().is_some()
+    }
+
+    fn set_output_dpms(&mut self, output: &Output, on: bool) -> bool {
+        let Some(id) = output.user_data().get::<UdevOutputId>().copied() else {
+            return false;
+        };
+        let Some(device) = self.devices.get_mut(&id.device_id) else {
+            return false;
+        };
+        let Some(surface) = device.surfaces.get_mut(&id.crtc) else {
+            return false;
+        };
+        if on {
+            // clear() left the CRTC inactive; the next queue_frame must modeset.
+            surface.drm_output.reset_buffers();
+            return true;
+        }
+        match surface.drm_output.with_compositor(|c| c.clear()) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!("DPMS off failed on {}: {err}", output.name());
+                false
+            }
+        }
+    }
+
+    fn prepare_resume(&mut self) {
+        for (node, device) in &mut self.devices {
+            if let Err(err) = device.drm_output_manager.lock().activate(false) {
+                warn!("Failed to activate DRM device {node} after resume: {err}");
+            }
+        }
+    }
+
     fn schedule_render(&mut self, output: &Output) {
         let Some(id) = output.user_data().get::<UdevOutputId>().copied() else {
             return;
@@ -251,40 +287,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             SessionEvent::ActivateSession => {
                 info!("session resumed");
-                let nodes: Vec<DrmNode> = state.backend_data.devices.keys().copied().collect();
-                for node in nodes {
-                    let crtcs: Vec<crtc::Handle> = match state.backend_data.devices.get_mut(&node) {
-                        Some(device) => {
-                            if let Err(err) = device.drm_output_manager.lock().activate(false) {
-                                warn!("Failed to activate DRM device {node}: {err}");
-                            }
-                            device.surfaces.keys().copied().collect()
-                        }
-                        None => continue,
-                    };
-
-                    // The previous swapchain buffers are stale after a VT switch;
-                    // discard them so the next frame is a clean full render.
-                    let outputs: Vec<Output> = state
-                        .space
-                        .outputs()
-                        .filter(|o| {
-                            o.user_data()
-                                .get::<UdevOutputId>()
-                                .is_some_and(|id| id.device_id == node)
-                        })
-                        .cloned()
-                        .collect();
-                    for output in &outputs {
-                        state.backend_data.reset_buffers(output);
-                    }
-
-                    for crtc in crtcs {
-                        state.backend_data.loop_handle.insert_idle(move |state| {
-                            state.render_surface(node, crtc);
-                        });
-                    }
-                }
+                state.resume_drm_session();
             }
         })?;
 
@@ -593,6 +596,7 @@ impl State<UdevData> {
             })
             .cloned();
         if let Some(output) = output {
+            self.output_power.output_removed(&output);
             self.space.unmap_output(&output);
         }
     }
@@ -617,6 +621,10 @@ impl State<UdevData> {
         let Some(output) = self.output_for_crtc(node, crtc) else {
             return;
         };
+
+        if self.output_power.is_off(&output) {
+            return;
+        }
 
         let queued = {
             let Some(renderer) = self.backend_data.renderer.as_mut() else {

@@ -44,6 +44,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::backend::Backend;
 use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
+use crate::handlers::output_power::OutputPowerManagerState;
 
 /// What a toplevel *is*, decided at the first commit from client-declared
 /// facts (parent, title/app_id, dialog hint).
@@ -144,6 +145,7 @@ pub struct State<BackendData: Backend + 'static> {
     pub idle_inhibit_manager_state: IdleInhibitManagerState,
     pub data_control_state: DataControlState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
+    pub output_power: OutputPowerManagerState,
     /// Surfaces holding an active `zwp_idle_inhibitor_v1`; while non-empty the
     /// idle notifier is inhibited.
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
@@ -208,6 +210,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let idle_inhibit_manager_state = IdleInhibitManagerState::new::<Self>(&dh);
         let data_control_state = DataControlState::new::<Self, _>(&dh, None, |_| true);
         let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
+        let output_power = OutputPowerManagerState::new::<Self>(&dh);
         TextInputManagerState::new::<Self>(&dh);
         InputMethodManagerState::new::<Self, _>(&dh, |_client| true);
         VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
@@ -255,6 +258,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             idle_inhibit_manager_state,
             data_control_state,
             fractional_scale_manager_state,
+            output_power,
             idle_inhibiting_surfaces: HashSet::new(),
             layer_shell_on_demand_focus: None,
             active_window: None,
