@@ -293,6 +293,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         socket_name
     }
 
+    /// Queue a redraw on every output; the backend skips ones already pending.
+    pub fn schedule_render(&mut self) {
+        let outputs: Vec<Output> = self.space.outputs().cloned().collect();
+        for output in &outputs {
+            self.backend_data.schedule_render(output);
+        }
+    }
+
     /// Send frame callbacks to every visible surface on `output`, once per
     /// presented frame. Lifecycle bookkeeping happens in the backends' idle
     /// callbacks instead, so client I/O isn't blocked on frame presentation.

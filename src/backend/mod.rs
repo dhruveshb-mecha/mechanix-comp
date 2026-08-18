@@ -67,6 +67,9 @@ pub trait Backend {
 
     fn change_vt(&mut self, _vt: i32) {} // no-op by default
 
+    /// Queue a redraw of `output`; the backend skips ones already pending.
+    fn schedule_render(&mut self, _output: &Output) {}
+
     /// Transform to apply to absolute (touch) input positions for `output`.
     /// Nested winit windows already report positions in window space, so they
     /// want identity; udev/DRM (and trait default) reports them in the output's transformed space.

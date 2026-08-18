@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -96,6 +96,8 @@ pub struct UdevData {
     /// Cache of imported cursor frames, keyed by the raw xcursor image.
     pointer_images: Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
     pointer_element: PointerElement,
+    /// CRTCs with a render already queued, so `schedule_render` on them is a no-op.
+    pending_render: HashSet<(DrmNode, crtc::Handle)>,
 }
 
 impl Backend for UdevData {
@@ -123,6 +125,22 @@ impl Backend for UdevData {
         if let Err(err) = self.session.change_vt(vt) {
             error!(vt, "Error switching vt: {}", err);
         }
+    }
+
+    fn schedule_render(&mut self, output: &Output) {
+        let Some(id) = output.user_data().get::<UdevOutputId>().copied() else {
+            return;
+        };
+        if !self.pending_render.insert((id.device_id, id.crtc)) {
+            return;
+        }
+        self.loop_handle.insert_idle(move |state| {
+            state
+                .backend_data
+                .pending_render
+                .remove(&(id.device_id, id.crtc));
+            state.render_surface(id.device_id, id.crtc);
+        });
     }
 }
 
@@ -167,6 +185,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         pointer_image: crate::cursor::Cursor::load(),
         pointer_images: Vec::new(),
         pointer_element: PointerElement::default(),
+        pending_render: HashSet::new(),
     };
 
     let mut state = State::new(&mut event_loop, display, udev_data);
@@ -593,25 +612,11 @@ impl State<UdevData> {
         }
     }
 
-    /// Render one CRTC. On damage, queue a pageflip and wait for the vblank
-    /// (`frame_finish` re-arms). On no damage, re-arm a poll ~one frame later.
+    /// Render one CRTC: queue a pageflip on damage, deliver frame callbacks otherwise.
     fn render_surface(&mut self, node: DrmNode, crtc: crtc::Handle) {
-        let Some(output) = self
-            .space
-            .outputs()
-            .find(|o| {
-                o.user_data().get::<UdevOutputId>()
-                    == Some(&UdevOutputId {
-                        device_id: node,
-                        crtc,
-                    })
-            })
-            .cloned()
-        else {
+        let Some(output) = self.output_for_crtc(node, crtc) else {
             return;
         };
-
-        let frame_duration = frame_duration(&output);
 
         let queued = {
             let Some(renderer) = self.backend_data.renderer.as_mut() else {
@@ -770,15 +775,10 @@ impl State<UdevData> {
         };
 
         if !queued {
-            // No pageflip pending; poll again after one refresh interval.
-            let timer = Timer::from_duration(frame_duration);
-            let _ = self
-                .backend_data
-                .loop_handle
-                .insert_source(timer, move |_, _, state| {
-                    state.render_surface(node, crtc);
-                    TimeoutAction::Drop
-                });
+            // No pageflip; still deliver frame callbacks for the commit that woke us.
+            self.send_frame_callbacks(&output);
+            // Keep repainting so surface removals get re-rendered.
+            self.schedule_repaint(&output);
         }
     }
 
@@ -802,30 +802,56 @@ impl State<UdevData> {
             }
         }
 
-        let output = self
-            .space
-            .outputs()
-            .find(|o| {
-                o.user_data().get::<UdevOutputId>()
-                    == Some(&UdevOutputId {
-                        device_id: node,
-                        crtc,
-                    })
-            })
-            .cloned();
-        if let Some(output) = output {
+        if let Some(output) = self.output_for_crtc(node, crtc) {
             self.send_frame_callbacks(&output);
-            self.backend_data.loop_handle.insert_idle(move |state| {
-                state.render_surface(node, crtc);
-            });
+            self.schedule_repaint(&output);
         }
     }
-}
 
-fn frame_duration(output: &Output) -> Duration {
-    output
-        .current_mode()
-        .filter(|mode| mode.refresh > 0)
-        .map(|mode| Duration::from_secs_f64(1000.0 / mode.refresh as f64))
-        .unwrap_or_else(|| Duration::from_millis(16))
+    /// Schedule the next repaint after a short delay: frame-callback-driven
+    /// clients repaint during it, and late changes (e.g. surface removal) are
+    /// picked up instead of leaving a stale frame on the CRTC.
+    fn schedule_repaint(&mut self, output: &Output) {
+        let Some(id) = output.user_data().get::<UdevOutputId>().copied() else {
+            return;
+        };
+        if !self
+            .backend_data
+            .pending_render
+            .insert((id.device_id, id.crtc))
+        {
+            return;
+        }
+        let frame_duration = output
+            .current_mode()
+            .map(|mode| Duration::from_secs_f64(1_000f64 / mode.refresh as f64))
+            .unwrap_or(Duration::from_millis(16));
+        let repaint_delay = Duration::from_secs_f64(frame_duration.as_secs_f64() * 0.6);
+        if self
+            .backend_data
+            .loop_handle
+            .insert_source(Timer::from_duration(repaint_delay), move |_, _, state| {
+                state
+                    .backend_data
+                    .pending_render
+                    .remove(&(id.device_id, id.crtc));
+                state.render_surface(id.device_id, id.crtc);
+                TimeoutAction::Drop
+            })
+            .is_err()
+        {
+            warn!("failed to schedule repaint");
+        }
+    }
+
+    fn output_for_crtc(&self, node: DrmNode, crtc: crtc::Handle) -> Option<Output> {
+        let id = UdevOutputId {
+            device_id: node,
+            crtc,
+        };
+        self.space
+            .outputs()
+            .find(|o| o.user_data().get() == Some(&id))
+            .cloned()
+    }
 }
