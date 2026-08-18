@@ -142,7 +142,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // Re-arrange layers for the new size, keeping toplevels filling
                 // the (possibly changed) non-exclusive zone.
                 layer_map_for_output(&output).arrange();
-                state.reflow_toplevels();
+                state.apply_layout(&output);
 
                 if state.is_locked {
                     let logical_size = state.space.output_geometry(&output).map(|geo| geo.size);

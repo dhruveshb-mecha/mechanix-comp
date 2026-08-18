@@ -24,7 +24,7 @@ use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 use smithay::wayland::{Dispatch2, GlobalDispatch2};
 
 use crate::backend::Backend;
-use crate::state::{State, WindowKind, WindowMode};
+use crate::state::{State, WindowMode};
 
 const WLR_MANAGEMENT_VERSION: u32 = 3;
 
@@ -294,7 +294,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         let mut snapshots: Vec<ToplevelSnapshot> = Vec::new();
         for (surface, ws) in &self.toplevels {
-            if matches!(ws.kind, WindowKind::Transient(_)) || !surface.is_alive() {
+            if !surface.is_alive() {
                 continue;
             }
             let (title, app_id) = foreign_toplevel_title_app_id(surface);

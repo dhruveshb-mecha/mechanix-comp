@@ -45,39 +45,24 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use crate::backend::Backend;
 use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
 use crate::handlers::output_power::OutputPowerManagerState;
-
-/// What a toplevel *is*, decided at the first commit from client-declared
-/// facts (parent, title/app_id, dialog hint).
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum WindowKind {
-    /// A regular toplevel: subject to the maximize/fullscreen policy.
-    Normal,
-    /// A dialog: never maximized/fullscreen, kept centered over its parent.
-    Dialog,
-    /// A parentless, untitled toplevel (GTK3 tooltip fallback that couldn't
-    /// become an xdg_popup): rendered above windows, never focused, kept out
-    /// of the `Space`; the compositor positions it.
-    Transient(Point<i32, Logical>),
-}
+use crate::layout::Layout;
 
 /// How a toplevel is arranged right now.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum WindowMode {
-    /// The window keeps its own size, centered in the work zone.
-    Floating,
-    /// The window fills the work zone.
+    /// Fills the work zone (default; re-applied on zone changes).
     Maximized,
-    /// The window fills the output and renders above the top layer.
+    /// Dialogs: never sized or maximized, kept centered over their parent.
+    Floating,
+    /// Fullscreen request honored: rendered above the top layer.
     Fullscreen,
 }
 
-/// Everything the compositor tracks about one xdg toplevel, keyed in
-/// `State::toplevels` by its `wl_surface`.
+/// A toplevel's mapping state, keyed in `State::toplevels` by its `wl_surface`.
 pub struct WindowState {
     pub window: Window,
-    pub kind: WindowKind,
     pub mode: WindowMode,
-    /// True once first-commit handling ran; transients are marked too, though they never join the `Space`.
+    /// True once first-commit handling ran and the window joined the `Space`.
     pub mapped: bool,
     /// The xdg-dialog modal hint, cached so input handling needn't lock
     /// surface data on every click.
@@ -146,6 +131,9 @@ pub struct State<BackendData: Backend + 'static> {
     pub data_control_state: DataControlState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
     pub output_power: OutputPowerManagerState,
+    /// One layout model per output; the source of truth for window stacking.
+    #[allow(clippy::mutable_key_type)] // `Output` is interior-mutable, but stable as a key.
+    pub layouts: HashMap<Output, Layout>,
     /// Surfaces holding an active `zwp_idle_inhibitor_v1`; while non-empty the
     /// idle notifier is inhibited.
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
@@ -211,6 +199,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let data_control_state = DataControlState::new::<Self, _>(&dh, None, |_| true);
         let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
         let output_power = OutputPowerManagerState::new::<Self>(&dh);
+        #[allow(clippy::mutable_key_type)] // `Output` is interior-mutable, but stable as a key.
+        let layouts: HashMap<Output, Layout> = HashMap::new();
         TextInputManagerState::new::<Self>(&dh);
         InputMethodManagerState::new::<Self, _>(&dh, |_client| true);
         VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
@@ -259,6 +249,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             data_control_state,
             fractional_scale_manager_state,
             output_power,
+            layouts,
             idle_inhibiting_surfaces: HashSet::new(),
             layer_shell_on_demand_focus: None,
             active_window: None,
@@ -341,12 +332,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 });
                 self.push_fractional_scale(layer_surface.wl_surface(), scale);
             }
-            for (window, _) in self.transient_windows() {
-                window.send_frame(output, now, Some(Duration::ZERO), |_, _| {
-                    Some(output.clone())
-                });
-                self.push_fractional_scale(window.toplevel().unwrap().wl_surface(), scale);
-            }
         }
     }
 
@@ -368,14 +353,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     pub fn update_idle_inhibit(&mut self) {
         let inhibited = !self.idle_inhibiting_surfaces.is_empty();
         self.idle_notifier_state.set_is_inhibited(inhibited);
-    }
-
-    /// The tracked transient tooltip fallbacks and their positions.
-    pub fn transient_windows(&self) -> impl Iterator<Item = (&Window, Point<i32, Logical>)> {
-        self.toplevels.values().filter_map(|ws| match ws.kind {
-            WindowKind::Transient(loc) => Some((&ws.window, loc)),
-            _ => None,
-        })
     }
 
     /// The topmost window currently in `Fullscreen` mode, if any. While one is
@@ -400,6 +377,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     pub fn cleanup_toplevels(&mut self) {
         self.toplevels
             .retain(|_, ws| ws.window.toplevel().unwrap().wl_surface().is_alive());
+        for layout in self.layouts.values_mut() {
+            layout.retain(|s| s.is_alive());
+        }
         // Prune dead idle-inhibitor surfaces and re-evaluate.
         self.idle_inhibiting_surfaces
             .retain(|surface| surface.is_alive());
