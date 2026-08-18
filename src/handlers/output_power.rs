@@ -109,6 +109,19 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.output_power.send_mode(output, on);
     }
 
+    /// Wake every blanked output. Returns true if anything was off, so the
+    /// caller can consume the input that woke the panel.
+    pub fn wake_outputs_if_off(&mut self) -> bool {
+        if self.output_power.off.is_empty() {
+            return false;
+        }
+        let outputs: Vec<Output> = self.output_power.off.iter().cloned().collect();
+        for output in &outputs {
+            self.set_output_power(output, true);
+        }
+        true
+    }
+
     /// Re-activate DRM after a VT switch, keeping DPMS-off outputs blanked.
     pub fn resume_drm_session(&mut self) {
         self.backend_data.prepare_resume();

@@ -370,6 +370,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
+        // Wake blanked outputs on any input; consume the event that woke them.
+        if self.wake_outputs_if_off() {
+            return;
+        }
         // Any input event counts as user activity: reset the idle-notify
         // timers so `swayidle`-style clients don't go idle while the user is
         // using the compositor. The notifier itself keeps inhibited seats
