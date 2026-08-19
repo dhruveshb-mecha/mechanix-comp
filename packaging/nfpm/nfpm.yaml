@@ -1,0 +1,17 @@
+name: mechanix-compositor
+arch: "${PKG_ARCH}"
+platform: linux
+version: "${PKG_VERSION}"
+release: "${PKG_RELEASE}"
+section: utils
+priority: optional
+maintainer: "Mufeed Ali <mufeeda@mechasystems.com>, Ayaskant Panigrahi <ayaskantp@mechasystems.com>, Naman Agrawal <namana@mechasystems.com>, Shubham Patel <shubhamp@ext.mechasystems.com>"
+description: Wayland compositor for Mechanix OS
+homepage: https://github.com/mecha-org/mechanix-comp.git
+license: BSD
+
+contents:
+  - src: ./target/aarch64-unknown-linux-gnu/release/compositor
+    dst: /usr/bin/mechanix-compositor
+    file_info:
+      mode: 0755
