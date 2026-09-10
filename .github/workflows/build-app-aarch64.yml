@@ -62,7 +62,7 @@ jobs:
           MECHANIX_PACKAGER_VERSION: v0.0.1
         run: |
           mkdir -p "$RUNNER_TEMP/mechanix-packager"
-          curl -fsSL "https://github.com/dhruveshb-mecha/mechanix-packager/archive/refs/tags/${MECHANIX_PACKAGER_VERSION}.tar.gz" \
+          curl -fsSL "https://github.com/mecha-org/mechanix-packager/archive/refs/tags/${MECHANIX_PACKAGER_VERSION}.tar.gz" \
             | tar -xz -C "$RUNNER_TEMP/mechanix-packager" --strip-components=1
           echo "MECHANIX_PACKAGER_DIR=$RUNNER_TEMP/mechanix-packager" >> "$GITHUB_ENV"
 
