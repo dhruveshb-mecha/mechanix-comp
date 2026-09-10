@@ -30,6 +30,7 @@ use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
 use smithay::reexports::drm::control::{ModeTypeFlags, connector, crtc};
+use smithay::reexports::input::AccelProfile;
 use smithay::reexports::input::{DeviceCapability, Libinput};
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
@@ -259,6 +260,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     data.backend_data.keyboards.push(device.clone());
                 }
                 if device.has_capability(DeviceCapability::Pointer) {
+                    // Mice report raw 1:1 deltas by default; a high-DPI gaming
+                    // mouse then outruns the screen in milliseconds. Adaptive
+                    // acceleration (resolution-aware) keeps any pointer usable.
+                    if device.config_accel_is_available() {
+                        let _ = device.config_accel_set_profile(AccelProfile::Adaptive);
+                        let _ = device.config_accel_set_speed(0.0);
+                    }
                     data.backend_data.pointers.push(device.clone());
                     data.backend_data.pointer_moved = false;
                 }
