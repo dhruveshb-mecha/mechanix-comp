@@ -32,7 +32,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let output = self.space.outputs().next()?;
         let output_geo = self.space.output_geometry(output)?;
 
-        if self.is_locked {
+        if self.is_locked() {
             // Find if the pos is within any lock surface.
             for lock_surface in self.lock_surfaces.iter().filter(|s| s.alive()) {
                 let surface = lock_surface.wl_surface();
@@ -320,7 +320,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         pos: Point<f64, Logical>,
         serial: smithay::utils::Serial,
     ) {
-        if self.is_locked {
+        if self.is_locked() {
             if let Some((surface, _)) = self.surface_under(pos) {
                 self.seat
                     .get_keyboard()
@@ -378,7 +378,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         // timers so `swayidle`-style clients don't go idle while the user is
         // using the compositor. The notifier itself keeps inhibited seats
         // (zwp-idle-inhibit-v1) from idling.
-        self.session.idle_notifier_state.notify_activity(&self.seat);
+        self.idle_notifier_state.notify_activity(&self.seat);
         match event {
             InputEvent::Keyboard { event, .. } => match self.keyboard_key_to_action::<I>(event) {
                 // TODO Separate for different backends e.g. VtSwitch
@@ -419,6 +419,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     },
                 );
                 pointer.frame(self);
+                self.schedule_render();
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let output = self.space.outputs().next().unwrap();
@@ -443,6 +444,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     },
                 );
                 pointer.frame(self);
+                self.schedule_render();
             }
             InputEvent::PointerButton { event, .. } => {
                 let pointer = self.seat.get_pointer().unwrap();
