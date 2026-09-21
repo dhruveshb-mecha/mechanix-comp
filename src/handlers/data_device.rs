@@ -23,6 +23,7 @@ impl<BackendData: Backend + 'static> DndGrabHandler for State<BackendData> {
         _location: Point<f64, Logical>,
     ) {
         self.dnd_icon = None;
+        self.schedule_render();
     }
 }
 
@@ -39,6 +40,7 @@ impl<BackendData: Backend + 'static> WaylandDndGrabHandler for State<BackendData
             surface,
             offset: (0, 0).into(),
         });
+        self.schedule_render();
 
         match type_ {
             GrabType::Pointer => {
@@ -59,6 +61,6 @@ impl<BackendData: Backend + 'static> WaylandDndGrabHandler for State<BackendData
 
 impl<BackendData: Backend + 'static> DataDeviceHandler for State<BackendData> {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
-        &mut self.session.data_device_state
+        &mut self.data_device_state
     }
 }
