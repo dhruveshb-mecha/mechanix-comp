@@ -254,7 +254,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let layouts: HashMap<Output, Layout> = HashMap::new();
         CursorShapeManagerState::new::<Self>(&dh);
         let mut xdg_toplevel_icon = XdgToplevelIconManager::new::<Self>(&dh);
+        // Advertise two sizes; a scaled output picks the larger.
         xdg_toplevel_icon.add_icon_size(64);
+        xdg_toplevel_icon.add_icon_size(128);
         TextInputManagerState::new::<Self>(&dh);
         InputMethodManagerState::new::<Self, _>(&dh, |_client| true);
         VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);

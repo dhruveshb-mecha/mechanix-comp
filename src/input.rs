@@ -386,20 +386,16 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             InputEvent::PointerMotion { event } => {
                 let pointer = self.seat.get_pointer().unwrap();
                 let mut pos = pointer.current_location() + event.delta();
-                // Keep the pointer inside the outputs: without a bound, a fast
-                // mouse parks the cursor off-screen where it can't be seen.
+                // Clamp the pointer to the outputs' bounds.
                 if let Some(bounds) = self
                     .space
                     .outputs()
                     .filter_map(|output| self.space.output_geometry(output))
                     .reduce(|a, b| a.merge(b))
                 {
-                    pos.x = pos
-                        .x
-                        .clamp(bounds.loc.x as f64, (bounds.loc.x + bounds.size.w) as f64);
-                    pos.y = pos
-                        .y
-                        .clamp(bounds.loc.y as f64, (bounds.loc.y + bounds.size.h) as f64);
+                    let (x, y) = (bounds.loc.x as f64, bounds.loc.y as f64);
+                    pos.x = pos.x.clamp(x, x + bounds.size.w as f64 - 1.0);
+                    pos.y = pos.y.clamp(y, y + bounds.size.h as f64 - 1.0);
                 }
                 let serial = SERIAL_COUNTER.next_serial();
                 let under = self.surface_under(pos);

@@ -419,12 +419,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("no KMS-capable DRM device found".into());
     }
 
-    // Session pause/resume across VT switches.
+    // Suspend libinput with the session, which owns the device fds.
     event_loop
         .handle()
         .insert_source(notifier, move |event, &mut (), state| match event {
             SessionEvent::PauseSession => {
                 info!("session paused");
+                libinput_context.suspend();
                 state.backend_data.paused = true;
                 state.backend_data.cancel_queued_frames();
                 for device in state.backend_data.devices.values_mut() {
@@ -438,6 +439,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 info!("session resumed");
                 state.backend_data.paused = false;
                 state.resume_drm_session();
+                if let Err(err) = libinput_context.resume() {
+                    warn!(?err, "Failed to resume libinput: input stays dead");
+                }
             }
         })?;
 
