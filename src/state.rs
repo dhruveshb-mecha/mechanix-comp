@@ -18,7 +18,7 @@ use smithay::input::pointer::{CursorImageStatus, PointerHandle};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
 use smithay::reexports::calloop::{
-    EventLoop, Interest, LoopSignal, Mode, PostAction, generic::Generic,
+    EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction, generic::Generic,
 };
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -36,6 +36,7 @@ use smithay::wayland::compositor::{
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
+use smithay::wayland::drm_syncobj::DrmSyncobjState;
 use smithay::wayland::fifo::{FifoBarrierCachedState, FifoManagerState};
 use smithay::wayland::fractional_scale::{FractionalScaleManagerState, with_fractional_scale};
 use smithay::wayland::output::OutputManagerState;
@@ -45,6 +46,7 @@ use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer, WlrLayerS
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shm::ShmState;
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::viewporter::ViewporterState;
 
@@ -53,12 +55,14 @@ use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
 use smithay::wayland::idle_notify::IdleNotifierState;
 use smithay::wayland::input_method::InputMethodManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::selection::wlr_data_control::DataControlState;
 use smithay::wayland::session_lock::SessionLockManagerState;
 use smithay::wayland::shell::xdg::dialog::XdgDialogState;
 use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
 use smithay::wayland::xdg_activation::XdgActivationState;
+use smithay::wayland::xdg_foreign::XdgForeignState;
 use smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager;
 
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -145,6 +149,7 @@ pub struct State<BackendData: Backend + 'static> {
     pub display_handle: DisplayHandle,
 
     pub space: Space<Window>,
+    pub loop_handle: LoopHandle<'static, Self>,
     pub loop_signal: LoopSignal,
 
     /// All xdg toplevels ever created, keyed by `wl_surface`, whether or not
@@ -161,7 +166,9 @@ pub struct State<BackendData: Backend + 'static> {
     pub popups: PopupManager,
     pub xdg_activation_state: XdgActivationState,
     pub data_device_state: DataDeviceState,
+    pub primary_selection_state: PrimarySelectionState,
     pub data_control_state: DataControlState,
+    pub xdg_foreign_state: XdgForeignState,
     pub session_lock_state: SessionLockManagerState,
     pub foreign_toplevel: ForeignToplevelManagerState,
     pub foreign_toplevel_list: ForeignToplevelListState,
@@ -184,6 +191,7 @@ pub struct State<BackendData: Backend + 'static> {
     pub backend_data: BackendData,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: Option<DmabufGlobal>,
+    pub drm_syncobj_state: Option<DrmSyncobjState>,
     pub lock_phase: LockPhase,
     pub lock_surfaces: Vec<LockSurface>,
     pub lock_surface_outputs: HashMap<ObjectId, Output>,
@@ -246,19 +254,25 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let layouts: HashMap<Output, Layout> = HashMap::new();
         CursorShapeManagerState::new::<Self>(&dh);
         let mut xdg_toplevel_icon = XdgToplevelIconManager::new::<Self>(&dh);
+        // Advertise two sizes; a scaled output picks the larger.
         xdg_toplevel_icon.add_icon_size(64);
+        xdg_toplevel_icon.add_icon_size(128);
         TextInputManagerState::new::<Self>(&dh);
         InputMethodManagerState::new::<Self, _>(&dh, |_client| true);
         VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
         let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
+        let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
+        let data_control_state =
+            DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
+        let xdg_foreign_state = XdgForeignState::new::<Self>(&dh);
+        SinglePixelBufferState::new::<Self>(&dh);
         let session_lock_state = SessionLockManagerState::new::<Self, _>(&dh, |_| true);
         let foreign_toplevel = ForeignToplevelManagerState::new::<Self>(&dh);
         let foreign_toplevel_list = ForeignToplevelListState::new::<Self>(&dh);
         XdgDialogState::new::<Self>(&dh);
         let idle_notifier_state = IdleNotifierState::new(&dh, event_loop.handle());
         IdleInhibitManagerState::new::<Self>(&dh);
-        let data_control_state = DataControlState::new::<Self, _>(&dh, None, |_| true);
         let output_power = OutputPowerManagerState::new::<Self>(&dh);
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
@@ -268,6 +282,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             socket_name,
             xdg_activation_state,
             data_device_state,
+            primary_selection_state,
+            xdg_foreign_state,
             session_lock_state,
             foreign_toplevel,
             foreign_toplevel_list,
@@ -278,7 +294,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             display_handle: dh,
             space,
             toplevels: HashMap::new(),
+            loop_handle: event_loop.handle(),
             loop_signal,
+            drm_syncobj_state: None,
             compositor_state,
             xdg_shell_state,
             layer_shell_state,

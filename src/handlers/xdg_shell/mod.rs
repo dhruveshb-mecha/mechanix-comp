@@ -207,15 +207,17 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
 
         let focused_surface = window.toplevel().unwrap().wl_surface().clone();
+        let already = self.active_window.as_ref() == Some(&focused_surface);
         self.active_window = Some(focused_surface.clone());
         self.layer_shell_on_demand_focus = None;
 
-        if let Some(output) = self.primary_output() {
-            self.apply_layout(&output);
+        if !already {
+            if let Some(output) = self.primary_output() {
+                self.apply_layout(&output);
+            }
+            let group = self.active_group();
+            self.set_activated_group(&group);
         }
-
-        let group = self.active_group();
-        self.set_activated_group(&group);
 
         self.seat
             .get_keyboard()

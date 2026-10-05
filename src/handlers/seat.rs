@@ -15,6 +15,7 @@ use smithay::reexports::wayland_server::Resource;
 use smithay::utils::Rectangle;
 use smithay::wayland::input_method::{InputMethodHandler, PopupSurface};
 use smithay::wayland::selection::data_device::set_data_device_focus;
+use smithay::wayland::selection::primary_selection::set_primary_focus;
 use tracing::warn;
 
 impl<BackendData: Backend + 'static> SeatHandler for State<BackendData> {
@@ -32,11 +33,9 @@ impl<BackendData: Backend + 'static> SeatHandler for State<BackendData> {
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
-        set_data_device_focus(
-            &self.display_handle,
-            seat,
-            focused.and_then(|s| self.display_handle.get_client(s.id()).ok()),
-        );
+        let client = focused.and_then(|s| self.display_handle.get_client(s.id()).ok());
+        set_data_device_focus(&self.display_handle, seat, client.clone());
+        set_primary_focus(&self.display_handle, seat, client);
     }
 }
 
