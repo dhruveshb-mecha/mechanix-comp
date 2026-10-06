@@ -9,6 +9,9 @@ use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::data_device::{
     DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
 };
+use smithay::wayland::selection::primary_selection::{
+    PrimarySelectionHandler, PrimarySelectionState,
+};
 
 impl<BackendData: Backend + 'static> SelectionHandler for State<BackendData> {
     type SelectionUserData = ();
@@ -62,5 +65,11 @@ impl<BackendData: Backend + 'static> WaylandDndGrabHandler for State<BackendData
 impl<BackendData: Backend + 'static> DataDeviceHandler for State<BackendData> {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
         &mut self.data_device_state
+    }
+}
+
+impl<BackendData: Backend + 'static> PrimarySelectionHandler for State<BackendData> {
+    fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
+        &mut self.primary_selection_state
     }
 }

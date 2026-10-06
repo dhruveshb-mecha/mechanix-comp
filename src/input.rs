@@ -78,7 +78,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         // Topmost layer in `kinds` that accepts the point.
         let layer_under = |kinds: [WlrLayer; 2]| {
-            topmost_accepting_layer(&*map, pos - output_geo.loc.to_f64(), kinds)
+            topmost_accepting_layer(&map, pos - output_geo.loc.to_f64(), kinds)
                 .and_then(|layer| layer_surface_under(layer).or_else(|| layer_main_hit(layer)))
         };
 
@@ -137,12 +137,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 info!(cmd, "Starting program");
 
                 if let Err(e) = Command::new(&cmd)
-                    .envs(
-                        self.socket_name
-                            .to_str()
-                            .clone()
-                            .map(|v| ("WAYLAND_DISPLAY", v)),
-                    )
+                    .envs(self.socket_name.to_str().map(|v| ("WAYLAND_DISPLAY", v)))
                     .spawn()
                 {
                     error!(cmd, err = %e, "Failed to start program");
@@ -335,7 +330,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 let output_geo = self.space.output_geometry(&output)?;
                 let map = layer_map_for_output(&output);
                 let pos = pos - output_geo.loc.to_f64();
-                topmost_accepting_layer(&*map, pos, kinds).map(|layer| {
+                topmost_accepting_layer(&map, pos, kinds).map(|layer| {
                     let on_demand = layer.cached_state().keyboard_interactivity
                         == KeyboardInteractivity::OnDemand;
                     (layer.wl_surface().clone(), on_demand)
@@ -362,10 +357,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         } else if self.active_fullscreen_window().is_none()
             && let Some((surface, on_demand)) =
                 layer_under([WlrLayer::Bottom, WlrLayer::Background])
+            && on_demand
         {
-            if on_demand {
-                self.layer_shell_on_demand_focus = Some(surface);
-            }
+            self.layer_shell_on_demand_focus = Some(surface);
         }
     }
 
@@ -392,20 +386,16 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             InputEvent::PointerMotion { event } => {
                 let pointer = self.seat.get_pointer().unwrap();
                 let mut pos = pointer.current_location() + event.delta();
-                // Keep the pointer inside the outputs: without a bound, a fast
-                // mouse parks the cursor off-screen where it can't be seen.
+                // Clamp the pointer to the outputs' bounds.
                 if let Some(bounds) = self
                     .space
                     .outputs()
                     .filter_map(|output| self.space.output_geometry(output))
                     .reduce(|a, b| a.merge(b))
                 {
-                    pos.x = pos
-                        .x
-                        .clamp(bounds.loc.x as f64, (bounds.loc.x + bounds.size.w) as f64);
-                    pos.y = pos
-                        .y
-                        .clamp(bounds.loc.y as f64, (bounds.loc.y + bounds.size.h) as f64);
+                    let (x, y) = (bounds.loc.x as f64, bounds.loc.y as f64);
+                    pos.x = pos.x.clamp(x, x + bounds.size.w as f64 - 1.0);
+                    pos.y = pos.y.clamp(y, y + bounds.size.h as f64 - 1.0);
                 }
                 let serial = SERIAL_COUNTER.next_serial();
                 let under = self.surface_under(pos);
@@ -558,11 +548,11 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
 /// The topmost layer surface in `kinds` accepting `pos` (output-relative): a
 /// popup/subsurface under the point, or its main surface's input region.
 /// Click-through layers pass the point through.
-fn topmost_accepting_layer<'a>(
-    map: &'a smithay::desktop::LayerMap,
+fn topmost_accepting_layer(
+    map: &smithay::desktop::LayerMap,
     pos: Point<f64, Logical>,
     kinds: [WlrLayer; 2],
-) -> Option<&'a smithay::desktop::LayerSurface> {
+) -> Option<&smithay::desktop::LayerSurface> {
     kinds.into_iter().find_map(|kind| {
         map.layers_on(kind).rev().find(|layer| {
             let layer_loc = map.layer_geometry(layer).unwrap().loc;

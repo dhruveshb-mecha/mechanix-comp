@@ -18,6 +18,8 @@ use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{IsAlive, Rectangle, Transform};
 use smithay::wayland::compositor::with_states;
+use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
+use tracing::warn;
 
 use crate::backend::{Backend, Wakeups};
 use crate::drawing::{PointerElement, cached_pointer_buffer};
@@ -93,13 +95,31 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .window()
         .set_cursor_visible(false);
 
-    // Advertise zwp_linux_dmabuf_v1 with the formats the GLES renderer can
-    // import, now that the renderer exists.
-    let dmabuf_formats = state.backend_data.renderer().dmabuf_formats();
-    let dmabuf_global = state
-        .dmabuf_state
-        .create_global::<State<WinitData>>(&state.display_handle, dmabuf_formats);
-    state.dmabuf_global = Some(dmabuf_global);
+    // Advertise dmabuf feedback when a render node exists, else v3.
+    let formats = state.backend_data.renderer().dmabuf_formats();
+    match crate::backend::egl_render_node(state.backend_data.renderer().egl_context().display()) {
+        Some(node) => {
+            let feedback = DmabufFeedbackBuilder::new(node.dev_id(), formats)
+                .build()
+                .unwrap();
+            state.dmabuf_global = Some(
+                state
+                    .dmabuf_state
+                    .create_global_with_default_feedback::<State<WinitData>>(
+                        &state.display_handle,
+                        &feedback,
+                    ),
+            );
+        }
+        None => {
+            warn!("no EGL render node; advertising zwp_linux_dmabuf_v1 v3");
+            state.dmabuf_global = Some(
+                state
+                    .dmabuf_state
+                    .create_global::<State<WinitData>>(&state.display_handle, formats),
+            );
+        }
+    }
 
     let mode = Mode {
         size: state.backend_data.backend.window_size(),

@@ -2,6 +2,7 @@ pub mod compositor;
 pub mod data_control;
 pub mod data_device;
 pub mod dmabuf;
+pub mod drm_syncobj;
 pub mod foreign_toplevel;
 pub mod fractional_scale;
 pub mod idle;
@@ -13,6 +14,7 @@ pub mod session_lock;
 pub mod shm;
 pub mod xdg_activation;
 pub mod xdg_dialog;
+pub mod xdg_foreign;
 pub mod xdg_shell;
 pub mod xdg_toplevel_icon;
 

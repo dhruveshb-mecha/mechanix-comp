@@ -27,6 +27,7 @@ use smithay::backend::renderer::element::surface::{
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
+use smithay::wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd};
 use smithay::backend::udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu};
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::desktop::layer_map_for_output;
@@ -39,7 +40,7 @@ use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
 use smithay::reexports::drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc};
 use smithay::reexports::input::AccelProfile;
 use smithay::reexports::input::{DeviceCapability, Libinput};
-use smithay::reexports::rustix::fs::OFlags;
+use smithay::reexports::rustix::fs::{Mode, OFlags};
 use smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::reexports::wayland_server::Resource;
@@ -418,12 +419,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("no KMS-capable DRM device found".into());
     }
 
-    // Session pause/resume across VT switches.
+    // Suspend libinput with the session, which owns the device fds.
     event_loop
         .handle()
         .insert_source(notifier, move |event, &mut (), state| match event {
             SessionEvent::PauseSession => {
                 info!("session paused");
+                libinput_context.suspend();
                 state.backend_data.paused = true;
                 state.backend_data.cancel_queued_frames();
                 for device in state.backend_data.devices.values_mut() {
@@ -437,6 +439,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 info!("session resumed");
                 state.backend_data.paused = false;
                 state.resume_drm_session();
+                if let Err(err) = libinput_context.resume() {
+                    warn!(?err, "Failed to resume libinput: input stays dead");
+                }
             }
         })?;
 
@@ -515,10 +520,11 @@ impl State<UdevData> {
                     return Ok(());
                 }
             };
-            let software = EGLDevice::device_for_display(&egl_display)
-                .ok()
-                .is_some_and(|device| device.is_software());
-            if software {
+            let egl_device = EGLDevice::device_for_display(&egl_display).ok();
+            if egl_device
+                .as_ref()
+                .is_some_and(|device| device.is_software())
+            {
                 warn!("Ignoring {node}: software EGL renderer");
                 return Ok(());
             }
@@ -538,19 +544,17 @@ impl State<UdevData> {
                 }
             };
 
-            // Ask EGL for the render node to advertise (kmsro: not the card node).
             if self.dmabuf_global.is_none() {
+                // Import on the render node EGL uses (kmsro: not the display card).
+                let import_node = egl_device
+                    .and_then(|device| device.try_get_render_node().ok().flatten())
+                    .or_else(|| node.node_with_type(NodeType::Render).and_then(|r| r.ok()))
+                    .unwrap_or(node);
                 let dmabuf_formats = renderer.dmabuf_formats();
-
-                let render_node = super::egl_render_node(&egl_display)
-                    .or_else(|| node.node_with_type(NodeType::Render).and_then(|r| r.ok()));
-                let dmabuf_device = render_node.unwrap_or(node);
-
                 let default_feedback =
-                    DmabufFeedbackBuilder::new(dmabuf_device.dev_id(), dmabuf_formats.clone())
+                    DmabufFeedbackBuilder::new(import_node.dev_id(), dmabuf_formats.clone())
                         .build()
                         .unwrap();
-
                 let global = self
                     .dmabuf_state
                     .create_global_with_default_feedback::<State<UdevData>>(
@@ -559,10 +563,31 @@ impl State<UdevData> {
                     );
                 self.dmabuf_global = Some(global);
                 self.backend_data.render_dmabuf = Some(RenderDmabuf {
-                    device: dmabuf_device,
+                    device: import_node,
                     formats: dmabuf_formats,
                     feedback: default_feedback,
                 });
+                // Same card as KMS: reuse the session fd; render nodes are opened directly.
+                let import_fd = if import_node == node {
+                    Some(drm.device_fd().clone())
+                } else {
+                    import_node.dev_path().and_then(|path| {
+                        smithay::reexports::rustix::fs::open(
+                            &path,
+                            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                            Mode::empty(),
+                        )
+                        .ok()
+                        .map(|fd| DrmDeviceFd::new(DeviceFd::from(fd)))
+                    })
+                };
+                match import_fd.filter(supports_syncobj_eventfd) {
+                    Some(fd) => {
+                        self.drm_syncobj_state =
+                            Some(DrmSyncobjState::new::<Self>(&self.display_handle, fd));
+                    }
+                    None => warn!("not advertising linux-drm-syncobj on {import_node}"),
+                }
             }
             info!("Using {node} as the display device");
             self.backend_data.renderer = Some(renderer);
@@ -806,9 +831,14 @@ impl State<UdevData> {
             info!("Renderer card {node} removed");
             self.backend_data.renderer = None;
             self.backend_data.renderer_node = None;
+            self.backend_data.render_dmabuf = None;
             if let Some(global) = self.dmabuf_global.take() {
                 self.dmabuf_state
                     .destroy_global::<State<UdevData>>(&self.display_handle, global);
+            }
+            if let Some(syncobj) = self.drm_syncobj_state.take() {
+                self.display_handle
+                    .remove_global::<State<UdevData>>(syncobj.into_global());
             }
         }
     }
